@@ -113,6 +113,22 @@ class ModelArguments:
     add_faster_video: Optional[bool] = field(default=False)
     faster_token_stride: Optional[int] = field(default=10)
 
+    hypertok_config: Optional[str] = field(default=None, metadata={"help": "Path to HyperTok YAML config (optional)."})
+    hypertok_encoder: Optional[str] = field(default="vitamin_large")
+    hypertok_image_size: Optional[int] = field(default=256)
+    hypertok_embed_dim: Optional[int] = field(default=None)
+    hypertok_quantizer: Optional[str] = field(default="fsq", metadata={"help": "fsq|mcq|unitokmcq|unitokr|none"})
+    hypertok_levels: Optional[str] = field(default=None, metadata={"help": "Comma-separated levels for FSQ, e.g. 7 or 7,7,7"})
+    hypertok_num_codebooks: Optional[int] = field(default=128)
+    hypertok_num_codes: Optional[int] = field(default=32768)
+    hypertok_code_dim: Optional[int] = field(default=64)
+    hypertok_feature_source: Optional[str] = field(default="quant", metadata={"help": "quant|decoder_sem"})
+    hypertok_decoder_variant: Optional[str] = field(default="ours", metadata={"help": "ours|nohyper"})
+    hypertok_decoder_query_num: Optional[int] = field(default=16)
+    hypertok_decoder_film_layer_num: Optional[int] = field(default=5)
+    hypertok_decoder_hidden_dim: Optional[int] = field(default=768)
+    hypertok_decoder_num_heads: Optional[int] = field(default=16)
+
 
 
 @dataclass

@@ -60,6 +60,25 @@ class LlavaMetaModel:
 
         self.config.mm_vision_tower = vision_tower
         self.config.vision_tower_pretrained = getattr(model_args, "vision_tower_pretrained", "")
+        for attr in [
+            "hypertok_config",
+            "hypertok_encoder",
+            "hypertok_image_size",
+            "hypertok_embed_dim",
+            "hypertok_quantizer",
+            "hypertok_levels",
+            "hypertok_num_codebooks",
+            "hypertok_num_codes",
+            "hypertok_code_dim",
+            "hypertok_feature_source",
+            "hypertok_decoder_variant",
+            "hypertok_decoder_query_num",
+            "hypertok_decoder_film_layer_num",
+            "hypertok_decoder_hidden_dim",
+            "hypertok_decoder_num_heads",
+        ]:
+            if hasattr(model_args, attr):
+                setattr(self.config, attr, getattr(model_args, attr))
 
         if self.get_vision_tower() is None:
             vision_tower = build_vision_tower(model_args)
