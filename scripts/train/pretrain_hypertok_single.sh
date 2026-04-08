@@ -1,7 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
 export OMP_NUM_THREADS=8
-export NCCL_IB_DISABLE=0
-export NCCL_IB_GID_INDEX=3
-export NCCL_SOCKET_IFNAME=eth0
+export NCCL_IB_DISABLE=1
 export NCCL_DEBUG=INFO
 
 LLM_VERSION="/data/share/Qwen3.5-9B/"
@@ -21,7 +22,7 @@ PROMPT_VERSION=plain
 BASE_RUN_NAME="llavanext-${VISION_MODEL_VERSION_CLEAN}-${LLM_VERSION_CLEAN}-mlp2x_gelu-pretrain_blip558k_plain"
 echo "BASE_RUN_NAME: ${BASE_RUN_NAME}"
 
-ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NNODES}" --node_rank="${RANK}" --master_addr="${ADDR}" --master_port="${PORT}" \
+torchrun --nproc_per_node=1 --nnodes=1 --node_rank=0 --master_addr=127.0.0.1 --master_port=29500 \
     llava/train/train_mem.py \
     --deepspeed scripts/zero3.json \
     --model_name_or_path ${LLM_VERSION} \
@@ -41,7 +42,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --bf16 True \
     --output_dir /checkpoints/projectors/${BASE_RUN_NAME} \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 16 \
+    --per_device_train_batch_size 4 \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps 1 \
     --eval_strategy "no" \

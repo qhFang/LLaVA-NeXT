@@ -17,6 +17,10 @@
 import ast
 import os
 import copy
+import inspect
+from contextlib import contextmanager
+import io
+import bisect
 from dataclasses import dataclass, field
 import json
 import logging
@@ -38,7 +42,17 @@ import tokenizers
 import deepspeed
 
 from transformers import AutoConfig
+from transformers.modeling_utils import load_state_dict
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+from transformers.utils import (
+    SAFE_WEIGHTS_INDEX_NAME,
+    SAFE_WEIGHTS_NAME,
+    WEIGHTS_INDEX_NAME,
+    WEIGHTS_NAME,
+)
+from transformers.utils.hub import cached_file, get_checkpoint_shard_files
 from torch.utils.data import Dataset
+from torchvision import transforms
 from llava.constants import IGNORE_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IMAGE_TOKEN_INDEX
 from llava.train.llava_trainer import LLaVATrainer
 
@@ -128,6 +142,13 @@ class ModelArguments:
     hypertok_decoder_film_layer_num: Optional[int] = field(default=5)
     hypertok_decoder_hidden_dim: Optional[int] = field(default=768)
     hypertok_decoder_num_heads: Optional[int] = field(default=16)
+    qwen3_5_vl_weights: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": "If True, load Qwen3.5 VL checkpoints by remapping model.language_model.* -> model.*. "
+            "If False, expect text-only checkpoints. If None, auto-detect from config."
+        },
+    )
 
 
 
@@ -148,6 +169,33 @@ class DataArguments:
     frames_upbound: Optional[int] = field(default=0)
     add_time_instruction: Optional[bool] = field(default=False)
     force_sample: Optional[bool] = field(default=False)
+    parquet_image_column: Optional[str] = field(default="image")
+    parquet_conversation_column: Optional[str] = field(default="conversations")
+    parquet_id_column: Optional[str] = field(default="id")
+    use_hypertok_tfm: bool = field(default=False)
+
+
+class HypertokImageProcessor:
+    def __init__(self, size: int):
+        self.size = size
+        self.crop_size = {"height": size, "width": size}
+        self.image_mean = [0.5, 0.5, 0.5]
+        self.image_std = [0.5, 0.5, 0.5]
+        self._tfm = transforms.Compose(
+            [
+                transforms.Resize(size, interpolation=transforms.InterpolationMode.BICUBIC),
+                transforms.CenterCrop(size),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=self.image_mean, std=self.image_std),
+            ]
+        )
+
+    def preprocess(self, image, return_tensors="pt"):
+        if isinstance(image, list):
+            tensor_list = [self._tfm(img) for img in image]
+            return {"pixel_values": torch.stack(tensor_list, dim=0)}
+        tensor = self._tfm(image)
+        return {"pixel_values": tensor.unsqueeze(0)}
 
 
 @dataclass
@@ -176,6 +224,7 @@ class TrainingArguments(transformers.TrainingArguments):
     group_by_varlen: bool = field(default=False)
     group_by_modality_length: bool = field(default=False)
     group_by_modality_length_auto: bool = field(default=False)
+    group_by_length: bool = field(default=False)
     auto_find_batch_size: bool = field(default=False)
     gradient_checkpointing: bool = field(default=True)
     verbose_logging: bool = field(default=False)
@@ -183,6 +232,11 @@ class TrainingArguments(transformers.TrainingArguments):
     trainer_mode: str = field(default="regular", metadata={"help": "Mode of training (`regular`, `zo`)."})
     zo_eps: float = field(default=1e-3, metadata={"help": "MeZO hyperparameter epsilon."})
     zo_num_directions: int = field(default=1, metadata={"help": "Number of directions for MeZO."})
+    include_tokens_per_second: bool = field(default=False)
+    past_index: int = field(default=-1)
+    dispatch_batches: Optional[bool] = field(default=None)
+    split_batches: Optional[bool] = field(default=None)
+    deepspeed_plugin: Optional[object] = field(default=None)
 
 
 # @dataclass
@@ -588,7 +642,18 @@ def preprocess_qwen(sources, tokenizer: transformers.PreTrainedTokenizer, has_im
         tokenizer.add_tokens(["<image>"], special_tokens=True)
 
     image_token_index = tokenizer.convert_tokens_to_ids("<image>")
-    im_start, im_end = tokenizer.additional_special_tokens_ids
+    additional_ids = getattr(tokenizer, "additional_special_tokens_ids", None)
+    if not additional_ids:
+        additional_tokens = getattr(tokenizer, "additional_special_tokens", []) or []
+        additional_ids = tokenizer.convert_tokens_to_ids(additional_tokens)
+
+    if len(additional_ids) >= 2:
+        im_start, im_end = additional_ids[:2]
+    else:
+        im_start = tokenizer.convert_tokens_to_ids("<|im_start|>")
+        im_end = tokenizer.convert_tokens_to_ids("<|im_end|>")
+        if im_start is None or im_end is None:
+            raise ValueError("Missing Qwen special tokens <|im_start|> / <|im_end|> in tokenizer.")
     # unmask_tokens = ["<|im_start|>", "<|im_start|>", "\n"]
     unmask_tokens_idx =  [198, im_start, im_end]
     nl_tokens = tokenizer("\n").input_ids
@@ -976,9 +1041,87 @@ class LazySupervisedDataset(Dataset):
         super(LazySupervisedDataset, self).__init__()
         self.tokenizer = tokenizer
         self.list_data_dict = []
+        self._parquet_total_rows = 0
+        self._parquet_cum_rows = []
+        self._parquet_row_groups = {}
+        self._parquet_files = {}
+        self._parquet_warned = False
+        self._parquet_length_cache = {}
+        self._parquet_modality_cache = {}
+        self.data_args = data_args
+
+        def append_parquet_rows(rows):
+            image_col = data_args.parquet_image_column
+            conv_col = data_args.parquet_conversation_column
+            id_col = data_args.parquet_id_column
+            for row in rows:
+                conversations = row.get(conv_col)
+                if conversations is None and "conversations" in row:
+                    conversations = row.get("conversations")
+                if conversations is None and "conversation" in row:
+                    conversations = row.get("conversation")
+                if isinstance(conversations, np.ndarray):
+                    conversations = conversations.tolist()
+                if conversations is None:
+                    raise ValueError(f"Missing conversations column in parquet row. Expected '{conv_col}' or 'conversations'.")
+                sample = {"conversations": conversations}
+                if image_col in row:
+                    image_value = row.get(image_col)
+                    if isinstance(image_value, dict) and "bytes" in image_value:
+                        image_value = image_value.get("bytes")
+                    sample["image"] = image_value
+                if id_col in row and row.get(id_col) is not None:
+                    sample["id"] = row.get(id_col)
+                self.list_data_dict.append(sample)
 
         # Handle multiple JSON files specified in the data_path
-        if "{" in data_path and "}" in data_path:
+        if os.path.isdir(data_path):
+            parquet_files = sorted(pathlib.Path(data_path).glob("*.parquet"))
+            if not parquet_files:
+                raise ValueError(f"No .parquet files found in directory: {data_path}")
+            try:
+                import pyarrow.parquet as pq
+            except Exception as exn:
+                raise ImportError("pyarrow is required to read parquet datasets. Please install pyarrow.") from exn
+            data_args.dataset_paths = [str(p) for p in parquet_files]
+            for parquet_path in parquet_files:
+                rank0_print(f"Loading {parquet_path}")
+                parquet_file = pq.ParquetFile(parquet_path)
+                num_rows = parquet_file.metadata.num_rows
+                self._parquet_total_rows += num_rows
+                self._parquet_cum_rows.append((self._parquet_total_rows, str(parquet_path)))
+                row_group_sizes = [
+                    parquet_file.metadata.row_group(i).num_rows
+                    for i in range(parquet_file.metadata.num_row_groups)
+                ]
+                row_group_cum = []
+                total = 0
+                for size in row_group_sizes:
+                    total += size
+                    row_group_cum.append(total)
+                self._parquet_row_groups[str(parquet_path)] = row_group_cum
+        elif data_path.endswith(".parquet"):
+            try:
+                import pyarrow.parquet as pq
+            except Exception as exn:
+                raise ImportError("pyarrow is required to read parquet datasets. Please install pyarrow.") from exn
+            data_args.dataset_paths = [data_path]
+            rank0_print(f"Loading {data_path}")
+            parquet_file = pq.ParquetFile(data_path)
+            num_rows = parquet_file.metadata.num_rows
+            self._parquet_total_rows += num_rows
+            self._parquet_cum_rows.append((self._parquet_total_rows, str(data_path)))
+            row_group_sizes = [
+                parquet_file.metadata.row_group(i).num_rows
+                for i in range(parquet_file.metadata.num_row_groups)
+            ]
+            row_group_cum = []
+            total = 0
+            for size in row_group_sizes:
+                total += size
+                row_group_cum.append(total)
+            self._parquet_row_groups[str(data_path)] = row_group_cum
+        elif "{" in data_path and "}" in data_path:
             base_path, file_pattern = re.match(r"^(.*)\{(.*)\}\.json$", data_path).groups()
             file_names = file_pattern.split(",")
             rank0_print(f"Loading {file_names} from {base_path}")
@@ -1051,37 +1194,150 @@ class LazySupervisedDataset(Dataset):
         rank0_print(f"Loaded {len(self.list_data_dict)} samples from {data_path}")
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
-        self.data_args = data_args
 
     def __len__(self):
-        return len(self.list_data_dict)
+        return len(self.list_data_dict) + self._parquet_total_rows
+
+    def _get_parquet_row(self, parquet_path: str, row_idx: int) -> Dict:
+        try:
+            import pyarrow.parquet as pq
+        except Exception as exn:
+            raise ImportError("pyarrow is required to read parquet datasets. Please install pyarrow.") from exn
+
+        if parquet_path not in self._parquet_files:
+            self._parquet_files[parquet_path] = pq.ParquetFile(parquet_path)
+        parquet_file = self._parquet_files[parquet_path]
+        row_group_cum = self._parquet_row_groups[parquet_path]
+        row_group_idx = bisect.bisect_right(row_group_cum, row_idx)
+        row_group_start = 0 if row_group_idx == 0 else row_group_cum[row_group_idx - 1]
+        row_in_group = row_idx - row_group_start
+        table = parquet_file.read_row_group(row_group_idx)
+        row = table.slice(row_in_group, 1).to_pylist()[0]
+        return row
+
+    def _parquet_row_to_sample(self, row: Dict) -> Dict:
+        image_col = self.data_args.parquet_image_column
+        conv_col = self.data_args.parquet_conversation_column
+        id_col = self.data_args.parquet_id_column
+        conversations = row.get(conv_col)
+        if conversations is None and "conversations" in row:
+            conversations = row.get("conversations")
+        if conversations is None and "conversation" in row:
+            conversations = row.get("conversation")
+        if isinstance(conversations, np.ndarray):
+            conversations = conversations.tolist()
+        if conversations is None:
+            raise ValueError(f"Missing conversations column in parquet row. Expected '{conv_col}' or 'conversations'.")
+        sample = {"conversations": conversations}
+        if image_col in row:
+            image_value = row.get(image_col)
+            if isinstance(image_value, dict) and "bytes" in image_value:
+                image_value = image_value.get("bytes")
+            sample["image"] = image_value
+        if id_col in row and row.get(id_col) is not None:
+            sample["id"] = row.get(id_col)
+        return sample
+
+    def _get_length_from_sample(self, sample: Dict) -> int:
+        conversations = sample.get("conversations", [])
+        total = 0
+        for conv in conversations:
+            text = conv.get("value")
+            if text is None:
+                text = conv.get("content", "")
+            total += len(str(text).split())
+        if "image" in sample:
+            total += 128
+        return total
+
+    def _get_modality_length_from_sample(self, sample: Dict) -> int:
+        conversations = sample.get("conversations", [])
+        total = 0
+        for conv in conversations:
+            text = conv.get("value")
+            if text is None:
+                text = conv.get("content", "")
+            total += len(str(text).split())
+        if total <= 0:
+            raise ValueError(f"Conversation length is 0 for {sample}")
+        if "image" in sample or "video" in sample or self.data_args.early_mix_text:
+            return total
+        return -total
+
+    def _get_parquet_sample(self, parquet_idx: int) -> Dict:
+        if not self._parquet_cum_rows:
+            raise IndexError("Parquet index out of range and no parquet files were loaded.")
+        parquet_file_idx = bisect.bisect_right(
+            [end for end, _ in self._parquet_cum_rows], parquet_idx
+        )
+        parquet_start = 0 if parquet_file_idx == 0 else self._parquet_cum_rows[parquet_file_idx - 1][0]
+        parquet_path = self._parquet_cum_rows[parquet_file_idx][1]
+        row_idx = parquet_idx - parquet_start
+        row = self._get_parquet_row(parquet_path, row_idx)
+        return self._parquet_row_to_sample(row)
 
     @property
     def lengths(self):
-        length_list = []
-        for sample in self.list_data_dict:
-            img_tokens = 128 if "image" in sample else 0
-            length_list.append(sum(len(conv["value"].split()) for conv in sample["conversations"]) + img_tokens)
-        return length_list
+        dataset = self
+
+        class _LazyLengths:
+            def __len__(self):
+                return len(dataset)
+
+            def __getitem__(self, idx):
+                if idx < len(dataset.list_data_dict):
+                    return dataset._get_length_from_sample(dataset.list_data_dict[idx])
+                parquet_idx = idx - len(dataset.list_data_dict)
+                cached = dataset._parquet_length_cache.get(parquet_idx)
+                if cached is not None:
+                    return cached
+                sample = dataset._get_parquet_sample(parquet_idx)
+                length = dataset._get_length_from_sample(sample)
+                dataset._parquet_length_cache[parquet_idx] = length
+                return length
+
+            def __iter__(self):
+                for i in range(len(dataset)):
+                    yield self[i]
+
+        return _LazyLengths()
 
     @property
     def modality_lengths(self):
-        length_list = []
-        for sample in self.list_data_dict:
-            cur_len = sum(len(conv["value"].split()) for conv in sample["conversations"])
-            assert cur_len > 0, f"Conversation length is 0 for {sample}"
-            if "image" in sample or "video" in sample or self.data_args.early_mix_text:
-                length_list.append(cur_len)
-            else:
-                length_list.append(-cur_len)
-        return length_list
+        dataset = self
+
+        class _LazyModalityLengths:
+            def __len__(self):
+                return len(dataset)
+
+            def __getitem__(self, idx):
+                if idx < len(dataset.list_data_dict):
+                    return dataset._get_modality_length_from_sample(dataset.list_data_dict[idx])
+                parquet_idx = idx - len(dataset.list_data_dict)
+                cached = dataset._parquet_modality_cache.get(parquet_idx)
+                if cached is not None:
+                    return cached
+                sample = dataset._get_parquet_sample(parquet_idx)
+                length = dataset._get_modality_length_from_sample(sample)
+                dataset._parquet_modality_cache[parquet_idx] = length
+                return length
+
+            def __iter__(self):
+                for i in range(len(dataset)):
+                    yield self[i]
+
+        return _LazyModalityLengths()
 
     def process_image(self, image_file, overwrite_image_aspect_ratio=None):
         image_folder = self.data_args.image_folder
         processor = self.data_args.image_processor
         # print(f"\n\nInspecting the image path, folder = {image_folder}, image={image_file}\n\n")
         try:
-            image = Image.open(os.path.join(image_folder, image_file)).convert("RGB")
+            if isinstance(image_file, (bytes, bytearray, memoryview)):
+                image = Image.open(io.BytesIO(image_file)).convert("RGB")
+            else:
+                image_path = os.path.join(image_folder, image_file) if image_folder is not None else image_file
+                image = Image.open(image_path).convert("RGB")
         except Exception as exn:
             print(f"Failed to open image {image_file}. Exception:", exn)
             raise exn
@@ -1151,13 +1407,18 @@ class LazySupervisedDataset(Dataset):
             raise e
 
     def _get_item(self, i) -> Dict[str, torch.Tensor]:
-        sources = self.list_data_dict[i]
+        if i < len(self.list_data_dict):
+            sources = self.list_data_dict[i]
+        else:
+            parquet_idx = i - len(self.list_data_dict)
+            sources = self._get_parquet_sample(parquet_idx)
         if isinstance(i, int):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
+        sample = sources[0]
 
-        if "image" in sources[0]:
-            image_file = self.list_data_dict[i]["image"]
+        if "image" in sample:
+            image_file = sample["image"]
             if type(image_file) is list:
                 image = [self.process_image(f) for f in image_file]
                 # Handling multi images
@@ -1169,8 +1430,8 @@ class LazySupervisedDataset(Dataset):
                 image = [self.process_image(image_file)]
             sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
 
-        elif "video" in sources[0]:
-            video_file = self.list_data_dict[i]["video"]
+        elif "video" in sample:
+            video_file = sample["video"]
             video_folder = self.data_args.video_folder
             video_file = os.path.join(video_folder, video_file)
             suffix = video_file.split(".")[-1]
@@ -1227,7 +1488,7 @@ class LazySupervisedDataset(Dataset):
         else:
             sources = copy.deepcopy([e["conversations"] for e in sources])
 
-        has_image = ("image" in self.list_data_dict[i]) or ("video" in self.list_data_dict[i])
+        has_image = ("image" in sample) or ("video" in sample)
         data_dict = preprocess(sources, self.tokenizer, has_image=has_image)
 
         if "prompt" in data_dict:
@@ -1239,9 +1500,9 @@ class LazySupervisedDataset(Dataset):
             data_dict = dict(input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0])
 
         # image exist in the data
-        if "image" in self.list_data_dict[i]:
+        if "image" in sample:
             data_dict["image"] = image
-        elif "video" in self.list_data_dict[i]:
+        elif "video" in sample:
             data_dict["image"] = image
         elif self.data_args.is_multimodal:
             # image does not exist in the data, but the model is multimodal
@@ -1253,7 +1514,7 @@ class LazySupervisedDataset(Dataset):
         if prompt is not None:
             data_dict["prompt"] = prompt
 
-        data_dict["id"] = self.list_data_dict[i].get("id", i)
+        data_dict["id"] = sample.get("id", i)
 
         return data_dict
 
@@ -1310,6 +1571,80 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, dat
     train_dataset = LazySupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path, data_args=data_args)
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+
+
+def _resolve_qwen3_5_checkpoint_files(model_name_or_path: str, cache_dir: Optional[str] = None) -> list[str]:
+    index_names = [SAFE_WEIGHTS_INDEX_NAME, WEIGHTS_INDEX_NAME]
+    for index_name in index_names:
+        try:
+            index_file = cached_file(model_name_or_path, index_name, cache_dir=cache_dir)
+            shard_files, _ = get_checkpoint_shard_files(model_name_or_path, index_file)
+            return shard_files
+        except Exception:
+            pass
+
+    weight_names = [SAFE_WEIGHTS_NAME, WEIGHTS_NAME]
+    for weight_name in weight_names:
+        try:
+            weight_file = cached_file(model_name_or_path, weight_name, cache_dir=cache_dir)
+            return [weight_file]
+        except Exception:
+            pass
+
+    raise FileNotFoundError(f"Could not find weights in {model_name_or_path}")
+
+
+def _load_qwen3_5_state_dict(model_name_or_path: str, cache_dir: Optional[str] = None) -> Dict[str, torch.Tensor]:
+    state_dict = {}
+    for shard_file in _resolve_qwen3_5_checkpoint_files(model_name_or_path, cache_dir=cache_dir):
+        shard_state = load_state_dict(shard_file)
+        state_dict.update(shard_state)
+    return state_dict
+
+
+def _remap_qwen3_5_vl_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    remapped = {}
+    for key, value in state_dict.items():
+        if key.startswith("model.language_model."):
+            new_key = "model." + key[len("model.language_model.") :]
+            remapped[new_key] = value
+            continue
+        if key.startswith("model.visual") or key.startswith("model.vision_tower") or key.startswith("vision_tower"):
+            continue
+        remapped[key] = value
+    return remapped
+
+
+@contextmanager
+def _guard_zero3_empty_embedding_init():
+    orig_init_weights = transformers.modeling_utils.PreTrainedModel._init_weights
+
+    def _init_weights(self, module):
+        if isinstance(module, torch.nn.Embedding):
+            weight = module.weight
+            if weight is None or weight.numel() == 0:
+                return
+            padding_idx = getattr(module, "padding_idx", None)
+            if padding_idx is not None and padding_idx >= weight.shape[0]:
+                return
+        return orig_init_weights(self, module)
+
+    transformers.modeling_utils.PreTrainedModel._init_weights = _init_weights
+    try:
+        yield
+    finally:
+        transformers.modeling_utils.PreTrainedModel._init_weights = orig_init_weights
+
+
+@contextmanager
+def _disable_deepspeed_zero3_init():
+    try:
+        from deepspeed import zero
+    except Exception:
+        yield
+        return
+    with zero.Init(enabled=False):
+        yield
 
 
 def get_model(model_args, training_args, bnb_model_from_pretrained_args):
@@ -1420,6 +1755,58 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                 low_cpu_mem_usage=False,
                 **customized_kwargs,
             )
+        elif "qwen3" in model_args.model_name_or_path.lower() or "qwen3_5" in model_args.model_name_or_path.lower() or "qwen3.5" in model_args.model_name_or_path.lower():
+            cfg_full = AutoConfig.from_pretrained(model_args.model_name_or_path)
+            cfg_full_dict = cfg_full.to_dict()
+            cfg_pretrained = getattr(cfg_full, "text_config", None)
+            if cfg_pretrained is None:
+                text_config_dict = cfg_full_dict.get("text_config", cfg_full_dict)
+                cfg_pretrained = Qwen3_5TextConfig.from_dict(text_config_dict)
+
+            vocab_size = (
+                (cfg_full_dict.get("text_config") or {}).get("vocab_size")
+                or cfg_full_dict.get("vocab_size")
+                or getattr(cfg_pretrained, "vocab_size", 0)
+            )
+            if not vocab_size:
+                raise ValueError("Qwen3.5 config is missing vocab_size.")
+            cfg_pretrained.vocab_size = int(vocab_size)
+            if getattr(cfg_pretrained, "pad_token_id", None) is None:
+                cfg_pretrained.pad_token_id = getattr(cfg_pretrained, "eos_token_id", None) or 0
+            if cfg_pretrained.pad_token_id is not None and cfg_pretrained.pad_token_id >= cfg_pretrained.vocab_size:
+                fallback_pad = getattr(cfg_pretrained, "eos_token_id", 0)
+                cfg_pretrained.pad_token_id = fallback_pad if fallback_pad < cfg_pretrained.vocab_size else 0
+            cfg_pretrained.model_type = "llava_qwen3_5"
+            customized_kwargs["config"] = cfg_pretrained
+            vl_weights = model_args.qwen3_5_vl_weights
+            if vl_weights is None:
+                vl_weights = bool(cfg_full_dict.get("vision_config") or cfg_full_dict.get("image_token_id"))
+            if vl_weights:
+                state_dict = _load_qwen3_5_state_dict(model_args.model_name_or_path, cache_dir=training_args.cache_dir)
+                remapped_state_dict = _remap_qwen3_5_vl_state_dict(state_dict)
+                pretrained_kwargs = dict(customized_kwargs)
+                pretrained_kwargs.pop("config", None)
+                # NOTE: use HF low_cpu_mem_usage path to avoid CPU OOM at init.
+                with _guard_zero3_empty_embedding_init():
+                    model = LlavaQwen3_5ForCausalLM.from_pretrained(
+                        None,
+                        state_dict=remapped_state_dict,
+                        cache_dir=training_args.cache_dir,
+                        attn_implementation=training_args.attn_implementation,
+                        torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+                        low_cpu_mem_usage=True,
+                        config=cfg_pretrained,
+                        **pretrained_kwargs,
+                    )
+            else:
+                model = LlavaQwen3_5ForCausalLM.from_pretrained(
+                    model_args.model_name_or_path,
+                    cache_dir=training_args.cache_dir,
+                    attn_implementation=training_args.attn_implementation,
+                    torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+                    low_cpu_mem_usage=False,
+                    **customized_kwargs,
+                )
         elif "qwen" in model_args.model_name_or_path.lower():
             if "moe" in model_args.model_name_or_path.lower() or "A14B" in model_args.model_name_or_path:
                 model = LlavaQwenMoeForCausalLM.from_pretrained(
@@ -1584,7 +1971,8 @@ def train(attn_implementation=None):
         if model_args.version in conversation_lib.conv_templates:
             conversation_lib.default_conversation = conversation_lib.conv_templates[model_args.version]
         else:
-            conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
+            conversation_lib.default_conversation = conversation_lib.conv_templates["qwen_3_5"]
+
 
     if model_args.vision_tower is not None:
         model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
@@ -1594,6 +1982,8 @@ def train(attn_implementation=None):
 
         data_args.image_processor = vision_tower.image_processor
         data_args.is_multimodal = True
+        if data_args.use_hypertok_tfm and model_args.vision_tower == "hypertok":
+            data_args.image_processor = HypertokImageProcessor(size=model_args.hypertok_image_size)
 
         model.config.image_aspect_ratio = data_args.image_aspect_ratio
         if data_args.image_grid_pinpoints is not None:
@@ -1710,7 +2100,13 @@ def train(attn_implementation=None):
                         module = module.to(torch.bfloat16)
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
-    trainer = LLaVATrainer(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    trainer_kwargs = dict(model=model, tokenizer=tokenizer, args=training_args, **data_module)
+    trainer_sig = inspect.signature(transformers.Trainer.__init__)
+    if "tokenizer" not in trainer_sig.parameters:
+        trainer_kwargs.pop("tokenizer", None)
+        if "processing_class" in trainer_sig.parameters:
+            trainer_kwargs["processing_class"] = tokenizer
+    trainer = LLaVATrainer(**trainer_kwargs)
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)

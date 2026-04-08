@@ -1,4 +1,6 @@
 import os
+import inspect
+from enum import Enum
 import torch
 import torch.nn as nn
 import datetime
@@ -11,12 +13,58 @@ from trl.trainer import DPOTrainer
 from trl.trainer.utils import DPODataCollatorWithPadding
 
 from transformers import Trainer
-from transformers.trainer import is_sagemaker_mp_enabled, get_parameter_names, has_length, ALL_LAYERNORM_LAYERS, logger, is_accelerate_available, is_datasets_available, GradientAccumulationPlugin
+from transformers.trainer import (
+    is_sagemaker_mp_enabled,
+    get_parameter_names,
+    has_length,
+    logger,
+    is_accelerate_available,
+    is_datasets_available,
+    GradientAccumulationPlugin,
+)
+try:
+    from transformers.trainer import ALL_LAYERNORM_LAYERS
+except Exception:
+    from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
 from transformers.trainer_utils import seed_worker
+try:
+    from transformers.trainer_utils import TrainerState
+except Exception:
+    try:
+        from transformers.trainer import TrainerState
+    except Exception:
+        TrainerState = None
+try:
+    from transformers.integrations import deepspeed_init
+except Exception:
+    try:
+        from transformers.trainer import deepspeed_init
+    except Exception:
+        deepspeed_init = None
+try:
+    from transformers.trainer_utils import DebugOption
+except Exception:
+    try:
+        from transformers.trainer import DebugOption
+    except Exception:
+        class DebugOption(str, Enum):
+            UNDERFLOW_OVERFLOW = "underflow_overflow"
 from transformers.trainer_pt_utils import get_length_grouped_indices as get_length_grouped_indices_hf
 from transformers.trainer_pt_utils import AcceleratorConfig
 from typing import List, Optional
 from datetime import timedelta
+import time
+
+try:
+    from transformers.trainer_utils import get_model_param_count
+except Exception:
+    try:
+        from transformers.trainer import get_model_param_count
+    except Exception:
+        get_model_param_count = None
+
+
+import math
 
 if is_accelerate_available():
     from accelerate import Accelerator, skip_first_batches, InitProcessGroupKwargs
@@ -40,6 +88,16 @@ def maybe_zero_3(param, ignore_status=False, name=None):
     else:
         param = param.detach().cpu().clone()
     return param
+
+
+def _wrap_seed_worker(seed_worker_fn, num_workers, rank):
+    def _init_fn(worker_id):
+        try:
+            return seed_worker_fn(worker_id, num_workers, rank)
+        except TypeError:
+            return seed_worker_fn(worker_id)
+
+    return _init_fn
 
 
 def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
@@ -250,6 +308,8 @@ class LLaVATrainer(Trainer):
         super().__init__(**kwargs)
 
         args = self.args
+        if not hasattr(self, "use_apex"):
+            self.use_apex = False
 
         self.trainer_mode = getattr(args, "trainer_mode", "regular")
         self.zo_eps = getattr(args, "zo_eps", 1e-3)
@@ -452,10 +512,17 @@ class LLaVATrainer(Trainer):
         accelerator_kwargs = InitProcessGroupKwargs(timeout=timedelta(weeks=52))
         rank0_print("Setting NCCL timeout to INF to avoid running errors.")
 
-        # create accelerator object
-        self.accelerator = Accelerator(
-            dispatch_batches=self.args.dispatch_batches, split_batches=self.args.split_batches, deepspeed_plugin=self.args.deepspeed_plugin, gradient_accumulation_plugin=gradient_accumulation_plugin, kwargs_handlers=[accelerator_kwargs]
+        # create accelerator object (handle older accelerate versions)
+        accel_kwargs = dict(
+            dispatch_batches=self.args.dispatch_batches,
+            split_batches=self.args.split_batches,
+            deepspeed_plugin=self.args.deepspeed_plugin,
+            gradient_accumulation_plugin=gradient_accumulation_plugin,
+            kwargs_handlers=[accelerator_kwargs],
         )
+        supported = set(inspect.signature(Accelerator.__init__).parameters)
+        accel_kwargs = {k: v for k, v in accel_kwargs.items() if k in supported and v is not None}
+        self.accelerator = Accelerator(**accel_kwargs)
         # some Trainer classes need to use `gather` instead of `gather_for_metrics`, thus we store a flag
         self.gather_function = self.accelerator.gather_for_metrics
 
@@ -551,7 +618,11 @@ class LLaVATrainer(Trainer):
         if not isinstance(train_dataset, torch.utils.data.IterableDataset):
             dataloader_params["sampler"] = self._get_train_sampler()
             dataloader_params["drop_last"] = self.args.dataloader_drop_last
-            dataloader_params["worker_init_fn"] = seed_worker
+            dataloader_params["worker_init_fn"] = _wrap_seed_worker(
+                seed_worker,
+                self.args.dataloader_num_workers,
+                self.args.local_rank if self.args.local_rank is not None else -1,
+            )
             dataloader_params["prefetch_factor"] = self.args.dataloader_num_workers * 2 if self.args.dataloader_num_workers != 0 else None
 
         dataloader = self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))

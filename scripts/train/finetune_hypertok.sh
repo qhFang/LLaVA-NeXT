@@ -29,7 +29,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --deepspeed scripts/zero3.json \
     --model_name_or_path ${CKPT_PATH} \
     --version ${PROMPT_VERSION} \
-    --data_path /path/to/llava_instruct.json \
+    --data_path /data/share/250010203/data/recap558k/data/ \
     --image_folder /path/to/images \
     --pretrain_mm_mlp_adapter "/checkpoints/projectors/${BASE_RUN_NAME}/mm_projector.bin" \
     --mm_tunable_parts="mm_vision_tower,mm_mlp_adapter,mm_language_model" \
@@ -39,6 +39,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --hypertok_config ${HYPERTOK_CONFIG} \
     --hypertok_feature_source ${HYPERTOK_FEATURE_SOURCE} \
     --hypertok_quantizer ${HYPERTOK_QUANTIZER} \
+    --use_hypertok_tfm True \
     --mm_projector_type mlp2x_gelu \
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \

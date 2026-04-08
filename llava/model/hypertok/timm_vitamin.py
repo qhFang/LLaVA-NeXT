@@ -304,6 +304,10 @@ class GeGluMlp(nn.Module):
         hidden_features,
         act_layer = None,
         drop = 0.0,
+        norm_layer = None,
+        bias = None,
+        device = None,
+        dtype = None
     ):
         super().__init__()
         norm_layer = partial(get_norm_layer('layernorm'), eps=1e-6)

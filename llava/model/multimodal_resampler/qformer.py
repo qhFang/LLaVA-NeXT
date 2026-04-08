@@ -38,10 +38,47 @@ from transformers.modeling_outputs import (
 )
 from transformers.modeling_utils import (
     PreTrainedModel,
-    apply_chunking_to_forward,
-    find_pruneable_heads_and_indices,
-    prune_linear_layer,
 )
+
+def find_pruneable_heads_and_indices(heads, n_heads, head_size, already_pruned_heads):
+    """
+    Copied from older transformers: compute heads to prune and index mapping.
+    """
+    mask = torch.ones(n_heads, head_size)
+    heads = set(heads) - already_pruned_heads
+    for head in heads:
+        # adjust head index because of previously pruned heads
+        head = head - sum(1 for h in already_pruned_heads if h < head)
+        mask[head] = 0
+    mask = mask.view(-1).contiguous().eq(1)
+    index = torch.arange(n_heads * head_size)[mask].long()
+    return heads, index
+
+
+def prune_linear_layer(layer, index, dim=0):
+    """
+    Prune a linear layer to keep only entries in index.
+    """
+    index = index.to(layer.weight.device)
+    W = layer.weight.index_select(dim, index).clone().detach()
+    if layer.bias is not None:
+        if dim == 1:
+            b = layer.bias.clone().detach()
+        else:
+            b = layer.bias[index].clone().detach()
+    new_size = list(layer.weight.size())
+    new_size[dim] = index.size(0)
+    new_layer = nn.Linear(new_size[1], new_size[0], bias=layer.bias is not None).to(layer.weight.device)
+    new_layer.weight.requires_grad = False
+    new_layer.weight.copy_(W.contiguous())
+    new_layer.weight.requires_grad = True
+    if layer.bias is not None:
+        new_layer.bias.requires_grad = False
+        new_layer.bias.copy_(b.contiguous())
+        new_layer.bias.requires_grad = True
+    return new_layer
+
+
 from transformers.utils import logging
 from transformers.models.bert.configuration_bert import BertConfig
 

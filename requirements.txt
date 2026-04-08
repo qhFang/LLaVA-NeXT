@@ -284,7 +284,7 @@ tokenizers==0.15.2
 toml==0.10.2
 tomli==2.0.1
 toolz==0.12.1
-torch==2.1.2
+torch
 torchvision==0.16.2
 tornado==6.4
 tox==3.28.0
