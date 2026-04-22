@@ -238,6 +238,12 @@ class TrainingArguments(transformers.TrainingArguments):
     split_batches: Optional[bool] = field(default=None)
     deepspeed_plugin: Optional[object] = field(default=None)
 
+    def to_dict(self):
+        data = super().to_dict()
+        if "deepspeed_plugin" in data:
+            data["deepspeed_plugin"] = None
+        return data
+
 
 # @dataclass
 # class EvaluationArguments:
@@ -453,8 +459,11 @@ def preprocess_multimodal(sources: Sequence[str], data_args: DataArguments) -> D
     if not is_multimodal:
         return sources
 
+    alt_image_token = "<images>"
     for source in sources:
         for sentence in source:
+            if alt_image_token in sentence["value"]:
+                sentence["value"] = sentence["value"].replace(alt_image_token, DEFAULT_IMAGE_TOKEN)
             # TODO maybe this should be changed for interleaved data?
             # if DEFAULT_IMAGE_TOKEN in sentence["value"] and not sentence["value"].startswith(DEFAULT_IMAGE_TOKEN):
             # only check for num_im=1
@@ -666,6 +675,41 @@ def preprocess_qwen(sources, tokenizer: transformers.PreTrainedTokenizer, has_im
     # _user = tokenizer("user").input_ids + nl_tokens
     # _assistant = tokenizer("assistant").input_ids + nl_tokens
 
+    def _token_to_ids(token: str):
+        vocab = tokenizer.get_vocab()
+        if token in vocab:
+            return [tokenizer.convert_tokens_to_ids(token)]
+        return tokenizer(token).input_ids
+
+    def _coerce_token_ids(seq):
+        flat = []
+        for item in seq:
+            if isinstance(item, int):
+                flat.append(item)
+                continue
+            if isinstance(item, str):
+                flat.extend(_token_to_ids(item))
+                continue
+            if isinstance(item, (list, tuple, np.ndarray)):
+                flat.extend(_coerce_token_ids(list(item)))
+                continue
+            flat.extend(tokenizer(str(item)).input_ids)
+        return flat
+
+    def apply_chat_template_ids(messages):
+        # Ensure we always get token ids even if apply_chat_template defaults to string.
+        try:
+            output = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
+        except TypeError:
+            output = tokenizer.apply_chat_template(messages)
+        if hasattr(output, "input_ids"):
+            output = output.input_ids
+        elif isinstance(output, dict) and "input_ids" in output:
+            output = output["input_ids"]
+        if isinstance(output, str):
+            return tokenizer(output).input_ids
+        return _coerce_token_ids(output)
+
     # Apply prompt templates
     input_ids, targets = [], []
     for i, source in enumerate(sources):
@@ -676,7 +720,7 @@ def preprocess_qwen(sources, tokenizer: transformers.PreTrainedTokenizer, has_im
 
         # New version, use apply chat template
         # Build system message for each sentence
-        input_id += tokenizer.apply_chat_template([{"role" : "system", "content" : system_message}])
+        input_id += apply_chat_template_ids([{"role" : "system", "content" : system_message}])
         target += [IGNORE_INDEX] * len(input_id)
 
         for conv in source:
@@ -691,7 +735,7 @@ def preprocess_qwen(sources, tokenizer: transformers.PreTrainedTokenizer, has_im
             role =  roles.get(role, role)
 
             conv = [{"role" : role, "content" : content}]
-            encode_id = tokenizer.apply_chat_template(conv)
+            encode_id = apply_chat_template_ids(conv)
             input_id += encode_id
             if role in ["user", "system"]:
                 target += [IGNORE_INDEX] * len(encode_id)
@@ -700,6 +744,7 @@ def preprocess_qwen(sources, tokenizer: transformers.PreTrainedTokenizer, has_im
 
 
 
+        input_id = _coerce_token_ids(input_id)
         assert len(input_id) == len(target), f"{len(input_id)} != {len(target)}"
         for idx, encode_id in enumerate(input_id):
             if encode_id in unmask_tokens_idx:
@@ -751,6 +796,41 @@ def preprocess_llama3(
         return input_ids
 
     nl_tokens = tokenizer.convert_tokens_to_ids("\n\n")
+    def _token_to_ids(token: str):
+        vocab = tokenizer.get_vocab()
+        if token in vocab:
+            return [tokenizer.convert_tokens_to_ids(token)]
+        return tokenizer(token).input_ids
+
+    def _coerce_token_ids(seq):
+        flat = []
+        for item in seq:
+            if isinstance(item, int):
+                flat.append(item)
+                continue
+            if isinstance(item, str):
+                flat.extend(_token_to_ids(item))
+                continue
+            if isinstance(item, (list, tuple, np.ndarray)):
+                flat.extend(_coerce_token_ids(list(item)))
+                continue
+            flat.extend(tokenizer(str(item)).input_ids)
+        return flat
+
+    def apply_chat_template_ids(messages):
+        # Ensure we always get token ids even if apply_chat_template defaults to string.
+        try:
+            output = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
+        except TypeError:
+            output = tokenizer.apply_chat_template(messages)
+        if hasattr(output, "input_ids"):
+            output = output.input_ids
+        elif isinstance(output, dict) and "input_ids" in output:
+            output = output["input_ids"]
+        if isinstance(output, str):
+            return tokenizer(output).input_ids
+        return _coerce_token_ids(output)
+
     # Apply prompt templates
     input_ids, targets = [], []
     for i, source in enumerate(sources):
@@ -761,7 +841,7 @@ def preprocess_llama3(
 
         # New version, use apply chat template
         # Build system message for each sentence
-        input_id += tokenizer.apply_chat_template([{"role" : "system", "content" : system_message}])
+        input_id += apply_chat_template_ids([{"role" : "system", "content" : system_message}])
         target += [IGNORE_INDEX] * len(input_id)
 
         for conv in source:
@@ -777,7 +857,7 @@ def preprocess_llama3(
 
             conv = [{"role" : role, "content" : content}]
             # First is bos token we don't need here
-            encode_id = tokenizer.apply_chat_template(conv)[1:]
+            encode_id = apply_chat_template_ids(conv)[1:]
             input_id += encode_id
             if role in ["user", "system"]:
                 target += [IGNORE_INDEX] * len(encode_id)
@@ -786,6 +866,7 @@ def preprocess_llama3(
 
 
 
+        input_id = _coerce_token_ids(input_id)
         assert len(input_id) == len(target), f"{len(input_id)} != {len(target)}"
         for idx, encode_id in enumerate(input_id):
             if encode_id in unmask_tokens_idx:
@@ -1215,7 +1296,7 @@ class LazySupervisedDataset(Dataset):
         row = table.slice(row_in_group, 1).to_pylist()[0]
         return row
 
-    def _parquet_row_to_sample(self, row: Dict) -> Dict:
+    def _parquet_row_to_sample(self, row: Dict, parquet_path: Optional[str] = None, row_idx: Optional[int] = None) -> Dict:
         image_col = self.data_args.parquet_image_column
         conv_col = self.data_args.parquet_conversation_column
         id_col = self.data_args.parquet_id_column
@@ -1226,9 +1307,41 @@ class LazySupervisedDataset(Dataset):
             conversations = row.get("conversation")
         if isinstance(conversations, np.ndarray):
             conversations = conversations.tolist()
+        if isinstance(conversations, str):
+            try:
+                conversations = json.loads(conversations)
+            except Exception as exn:
+                raise ValueError(
+                    f"Parquet row has string conversations that is not JSON. "
+                    f"path={parquet_path}, row={row_idx}, type={type(conversations)}"
+                ) from exn
+        if not isinstance(conversations, list):
+            raise ValueError(
+                f"Parquet row conversations is not a list. path={parquet_path}, row={row_idx}, "
+                f"type={type(conversations)}"
+            )
         if conversations is None:
             raise ValueError(f"Missing conversations column in parquet row. Expected '{conv_col}' or 'conversations'.")
-        sample = {"conversations": conversations}
+        cleaned_convs = []
+        for conv in conversations:
+            if isinstance(conv, np.ndarray):
+                conv = conv.tolist()
+            if isinstance(conv, str):
+                conv = {"from": "human", "value": conv}
+            if not isinstance(conv, dict):
+                raise ValueError(
+                    f"Conversation item is not dict. path={parquet_path}, row={row_idx}, type={type(conv)}"
+                )
+            value = conv.get("value", conv.get("content", ""))
+            if not isinstance(value, str):
+                value = str(value)
+            conv["value"] = value
+            cleaned_convs.append(conv)
+        sample = {"conversations": cleaned_convs}
+        if parquet_path is not None:
+            sample["_parquet_path"] = parquet_path
+        if row_idx is not None:
+            sample["_parquet_row"] = row_idx
         if image_col in row:
             image_value = row.get(image_col)
             if isinstance(image_value, dict) and "bytes" in image_value:
@@ -1274,7 +1387,10 @@ class LazySupervisedDataset(Dataset):
         parquet_path = self._parquet_cum_rows[parquet_file_idx][1]
         row_idx = parquet_idx - parquet_start
         row = self._get_parquet_row(parquet_path, row_idx)
-        return self._parquet_row_to_sample(row)
+        try:
+            return self._parquet_row_to_sample(row, parquet_path=parquet_path, row_idx=row_idx)
+        except Exception as exn:
+            raise ValueError(f"Invalid parquet row. path={parquet_path}, row={row_idx}") from exn
 
     @property
     def lengths(self):
@@ -1391,7 +1507,7 @@ class LazySupervisedDataset(Dataset):
         # try other samples, in case it is file corruption issue
         for attempt_idx in range(num_base_retries):
             try:
-                next_index = min(i + 1, len(self.list_data_dict) - 1)
+                next_index = min(i + 1, len(self) - 1)
                 # sample_idx = random.choice(range(len(self)))
                 sample = self._get_item(next_index)
                 return sample
@@ -1417,18 +1533,34 @@ class LazySupervisedDataset(Dataset):
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
         sample = sources[0]
 
+        image = None
+        has_image = False
+
         if "image" in sample:
-            image_file = sample["image"]
-            if type(image_file) is list:
-                image = [self.process_image(f) for f in image_file]
-                # Handling multi images
-                # overwrite to process with simple pad
-                if len(image_file) > 1:
-                    image = [self.process_image(f, "pad") for f in image_file]
-                    image = [[im[0], im[1], "image"] for im in image]
+            image_file = sample.get("image", None)
+            # Some datasets keep the 'image' key but store None for missing images.
+            # Treat these as text-only samples to avoid crashing in process_image().
+            if image_file is None or image_file == "" or (isinstance(image_file, list) and len(image_file) == 0):
+                sources = copy.deepcopy([e["conversations"] for e in sources])
             else:
-                image = [self.process_image(image_file)]
-            sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
+                has_image = True
+                if type(image_file) is list:
+                    # Filter out None entries if present.
+                    image_file = [f for f in image_file if f is not None and f != ""]
+                    if len(image_file) == 0:
+                        has_image = False
+                        sources = copy.deepcopy([e["conversations"] for e in sources])
+                    else:
+                        image = [self.process_image(f) for f in image_file]
+                        # Handling multi images: overwrite to process with simple pad
+                        if len(image_file) > 1:
+                            image = [self.process_image(f, "pad") for f in image_file]
+                            image = [[im[0], im[1], "image"] for im in image]
+                else:
+                    image = [self.process_image(image_file)]
+
+                if has_image:
+                    sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
 
         elif "video" in sample:
             video_file = sample["video"]
@@ -1488,8 +1620,18 @@ class LazySupervisedDataset(Dataset):
         else:
             sources = copy.deepcopy([e["conversations"] for e in sources])
 
-        has_image = ("image" in sample) or ("video" in sample)
-        data_dict = preprocess(sources, self.tokenizer, has_image=has_image)
+        has_image = has_image or ("video" in sample)
+        try:
+            data_dict = preprocess(sources, self.tokenizer, has_image=has_image)
+        except Exception as exn:
+            parquet_path = sample.get("_parquet_path")
+            parquet_row = sample.get("_parquet_row")
+            sample_id = sample.get("id", i)
+            if parquet_path is not None or parquet_row is not None:
+                raise ValueError(
+                    f"Preprocess failed. id={sample_id}, path={parquet_path}, row={parquet_row}"
+                ) from exn
+            raise
 
         if "prompt" in data_dict:
             prompt = data_dict["prompt"]
@@ -1500,7 +1642,7 @@ class LazySupervisedDataset(Dataset):
             data_dict = dict(input_ids=data_dict["input_ids"][0], labels=data_dict["labels"][0])
 
         # image exist in the data
-        if "image" in sample:
+        if has_image and image is not None:
             data_dict["image"] = image
         elif "video" in sample:
             data_dict["image"] = image
@@ -1615,6 +1757,43 @@ def _remap_qwen3_5_vl_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[st
     return remapped
 
 
+def _log_loading_info(loading_info: Optional[Dict], model_tag: str) -> None:
+    if not loading_info:
+        rank0_print(f"Loading {model_tag} without loading_info.")
+        return
+    missing = loading_info.get("missing_keys") or []
+    unexpected = loading_info.get("unexpected_keys") or []
+    mismatched = loading_info.get("mismatched_keys") or []
+    error_msgs = loading_info.get("error_msgs") or []
+
+    rank0_print(
+        "Loading info for %s: missing=%d unexpected=%d mismatched=%d errors=%d"
+        % (model_tag, len(missing), len(unexpected), len(mismatched), len(error_msgs))
+    )
+    if missing:
+        rank0_print("Missing keys (first 20): %s" % missing[:20])
+    if unexpected:
+        rank0_print("Unexpected keys (first 20): %s" % unexpected[:20])
+    if mismatched:
+        rank0_print("Mismatched keys (first 20): %s" % mismatched[:20])
+    if error_msgs:
+        rank0_print("Loading errors (first 5): %s" % error_msgs[:5])
+
+
+def _from_pretrained_with_info(model_class, *args, **kwargs):
+    loading_info = None
+    try:
+        result = model_class.from_pretrained(*args, output_loading_info=True, **kwargs)
+    except TypeError:
+        result = model_class.from_pretrained(*args, **kwargs)
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], dict):
+        model, loading_info = result
+    else:
+        model = result
+    _log_loading_info(loading_info, getattr(model_class, "__name__", str(model_class)))
+    return model
+
+
 @contextmanager
 def _guard_zero3_empty_embedding_init():
     orig_init_weights = transformers.modeling_utils.PreTrainedModel._init_weights
@@ -1709,7 +1888,8 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         actual_model_class_name = f"{model_args.model_class_name}ForCausalLM"
         model_class = getattr(transformers, actual_model_class_name)
         rank0_print(f"Using model class {model_class} from {model_args.model_class_name}")
-        model = model_class.from_pretrained(
+        model = _from_pretrained_with_info(
+            model_class,
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
             attn_implementation=training_args.attn_implementation,
@@ -1719,7 +1899,8 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         )
     elif model_args.vision_tower is not None:
         if "mixtral" in model_args.model_name_or_path.lower():
-            model = LlavaMixtralForCausalLM.from_pretrained(
+            model = _from_pretrained_with_info(
+                LlavaMixtralForCausalLM,
                 model_args.model_name_or_path,
                 cache_dir=training_args.cache_dir,
                 attn_implementation=training_args.attn_implementation,
@@ -1731,7 +1912,8 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
 
             deepspeed.utils.set_z3_leaf_modules(model, [MixtralSparseMoeBlock])
         elif "mistral" in model_args.model_name_or_path.lower() or "zephyr" in model_args.model_name_or_path.lower():
-            model = LlavaMistralForCausalLM.from_pretrained(
+            model = _from_pretrained_with_info(
+                LlavaMistralForCausalLM,
                 model_args.model_name_or_path,
                 cache_dir=training_args.cache_dir,
                 attn_implementation=training_args.attn_implementation,
@@ -1747,7 +1929,8 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
             or "nous-hermes" in model_args.model_name_or_path.lower()
             and "wizard-2" in model_args.model_name_or_path.lower()
         ):
-            model = LlavaLlamaForCausalLM.from_pretrained(
+            model = _from_pretrained_with_info(
+                LlavaLlamaForCausalLM,
                 model_args.model_name_or_path,
                 cache_dir=training_args.cache_dir,
                 attn_implementation=training_args.attn_implementation,
@@ -1788,7 +1971,8 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                 pretrained_kwargs.pop("config", None)
                 # NOTE: use HF low_cpu_mem_usage path to avoid CPU OOM at init.
                 with _guard_zero3_empty_embedding_init():
-                    model = LlavaQwen3_5ForCausalLM.from_pretrained(
+                    model = _from_pretrained_with_info(
+                        LlavaQwen3_5ForCausalLM,
                         None,
                         state_dict=remapped_state_dict,
                         cache_dir=training_args.cache_dir,
@@ -1799,7 +1983,8 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                         **pretrained_kwargs,
                     )
             else:
-                model = LlavaQwen3_5ForCausalLM.from_pretrained(
+                model = _from_pretrained_with_info(
+                    LlavaQwen3_5ForCausalLM,
                     model_args.model_name_or_path,
                     cache_dir=training_args.cache_dir,
                     attn_implementation=training_args.attn_implementation,
@@ -1809,7 +1994,8 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                 )
         elif "qwen" in model_args.model_name_or_path.lower():
             if "moe" in model_args.model_name_or_path.lower() or "A14B" in model_args.model_name_or_path:
-                model = LlavaQwenMoeForCausalLM.from_pretrained(
+                model = _from_pretrained_with_info(
+                    LlavaQwenMoeForCausalLM,
                     model_args.model_name_or_path,
                     cache_dir=training_args.cache_dir,
                     attn_implementation=training_args.attn_implementation,
@@ -1821,7 +2007,8 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
 
                 deepspeed.utils.set_z3_leaf_modules(model, [Qwen2MoeSparseMoeBlock])
             else:
-                model = LlavaQwenForCausalLM.from_pretrained(
+                model = _from_pretrained_with_info(
+                    LlavaQwenForCausalLM,
                     model_args.model_name_or_path,
                     cache_dir=training_args.cache_dir,
                     attn_implementation=training_args.attn_implementation,
@@ -1830,7 +2017,8 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                     **customized_kwargs,
                 )
         elif "gemma" in model_args.model_name_or_path.lower():
-            model = LlavaGemmaForCausalLM.from_pretrained(
+            model = _from_pretrained_with_info(
+                LlavaGemmaForCausalLM,
                 model_args.model_name_or_path,
                 cache_dir=training_args.cache_dir,
                 attn_implementation=training_args.attn_implementation,
@@ -1841,7 +2029,8 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
         else:
             raise ValueError(f"Unknown model class {model_args}")
     else:
-        model = transformers.LlamaForCausalLM.from_pretrained(
+        model = _from_pretrained_with_info(
+            transformers.LlamaForCausalLM,
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
             attn_implementation=training_args.attn_implementation,
@@ -1988,12 +2177,15 @@ def train(attn_implementation=None):
         model.config.image_aspect_ratio = data_args.image_aspect_ratio
         if data_args.image_grid_pinpoints is not None:
             if isinstance(data_args.image_grid_pinpoints, str) and "x" in data_args.image_grid_pinpoints:
-                try:
-                    patch_size = data_args.image_processor.size[0]
-                except Exception as e:
-                    patch_size = data_args.image_processor.size["shortest_edge"]
+                if type(data_args.image_processor.size) is int:
+                    patch_size = data_args.image_processor.size
+                else:
+                    try:
+                        patch_size = data_args.image_processor.size[0]
+                    except Exception as e:
+                        patch_size = data_args.image_processor.size["shortest_edge"]
 
-                assert patch_size in [224, 336, 384, 448, 512], "patch_size should be in [224, 336, 384, 448, 512]"
+                assert patch_size in [224, 256, 336, 384, 448, 512], "patch_size should be in [224, 256, 336, 384, 448, 512]"
                 # Use regex to extract the range from the input string
                 matches = re.findall(r"\((\d+)x(\d+)\)", data_args.image_grid_pinpoints)
                 range_start = tuple(map(int, matches[0]))

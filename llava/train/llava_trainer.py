@@ -1,13 +1,16 @@
 import os
 import inspect
+import shutil
 from enum import Enum
 import torch
 import torch.nn as nn
 import datetime
+import numpy as np
+from packaging import version
 
 from accelerate import Accelerator
 from accelerate.utils import InitProcessGroupKwargs, GradientAccumulationPlugin
-from torch.utils.data import Dataset, Sampler, DataLoader
+from torch.utils.data import Dataset, Sampler, DataLoader, RandomSampler
 
 from trl.trainer import DPOTrainer
 from trl.trainer.utils import DPODataCollatorWithPadding
@@ -22,6 +25,23 @@ from transformers.trainer import (
     is_datasets_available,
     GradientAccumulationPlugin,
 )
+try:
+    from transformers.trainer import is_torch_xla_available
+except Exception:
+    def is_torch_xla_available():
+        return False
+try:
+    from accelerate.utils import DistributedType
+except Exception:
+    try:
+        from accelerate import DistributedType
+    except Exception:
+        class DistributedType:
+            DEEPSPEED = "DEEPSPEED"
+try:
+    from accelerate.utils import __version__ as accelerate_version
+except Exception:
+    accelerate_version = "0.0.0"
 try:
     from transformers.trainer import ALL_LAYERNORM_LAYERS
 except Exception:
@@ -49,6 +69,72 @@ except Exception:
     except Exception:
         class DebugOption(str, Enum):
             UNDERFLOW_OVERFLOW = "underflow_overflow"
+try:
+    import transformers.trainer_utils as _trainer_utils
+except Exception:
+    _trainer_utils = None
+try:
+    import transformers.trainer as _trainer
+except Exception:
+    _trainer = None
+
+def _safe_getattr(module, name, default=None):
+    if module is None:
+        return default
+    return getattr(module, name, default)
+
+TRAINER_STATE_NAME = _safe_getattr(_trainer_utils, "TRAINER_STATE_NAME", _safe_getattr(_trainer, "TRAINER_STATE_NAME"))
+TrainOutput = _safe_getattr(_trainer_utils, "TrainOutput", _safe_getattr(_trainer, "TrainOutput"))
+HPSearchBackend = _safe_getattr(_trainer_utils, "HPSearchBackend", _safe_getattr(_trainer, "HPSearchBackend"))
+hp_params = _safe_getattr(_trainer_utils, "hp_params", _safe_getattr(_trainer, "hp_params"))
+speed_metrics = _safe_getattr(_trainer_utils, "speed_metrics", _safe_getattr(_trainer, "speed_metrics"))
+get_dataloader_sampler = _safe_getattr(_trainer_utils, "get_dataloader_sampler", _safe_getattr(_trainer, "get_dataloader_sampler"))
+ParallelMode = _safe_getattr(_trainer_utils, "ParallelMode", _safe_getattr(_trainer, "ParallelMode"))
+try:
+    from transformers.trainer import deepspeed_load_checkpoint, _is_peft_model
+except Exception:
+    try:
+        from transformers.integrations import deepspeed_load_checkpoint
+    except Exception:
+        deepspeed_load_checkpoint = None
+
+    def _is_peft_model(_model):
+        return False
+try:
+    from transformers.trainer_utils import DebugUnderflowOverflow
+except Exception:
+    try:
+        from transformers.trainer import DebugUnderflowOverflow
+    except Exception:
+        DebugUnderflowOverflow = None
+try:
+    from transformers.trainer_pt_utils import SeedableRandomSampler
+except Exception:
+    SeedableRandomSampler = RandomSampler
+try:
+    from transformers.trainer_pt_utils import tpu_spmd_dataloader
+except Exception:
+    def tpu_spmd_dataloader(dataloader):
+        return dataloader
+try:
+    import torch_xla.core.xla_model as xm
+    import torch_xla.debug.metrics as met
+except Exception:
+    xm = None
+    met = None
+try:
+    from apex import amp
+except Exception:
+    amp = None
+try:
+    import smdistributed.modelparallel.torch as smp
+except Exception:
+    smp = None
+try:
+    from llava.utils import plot_graphs_based_on_log_history
+except Exception:
+    def plot_graphs_based_on_log_history(*_args, **_kwargs):
+        return None
 from transformers.trainer_pt_utils import get_length_grouped_indices as get_length_grouped_indices_hf
 from transformers.trainer_pt_utils import AcceleratorConfig
 from typing import List, Optional
@@ -310,6 +396,8 @@ class LLaVATrainer(Trainer):
         args = self.args
         if not hasattr(self, "use_apex"):
             self.use_apex = False
+        if not hasattr(self, "current_gradient_accumulation_steps"):
+            self.current_gradient_accumulation_steps = args.gradient_accumulation_steps
 
         self.trainer_mode = getattr(args, "trainer_mode", "regular")
         self.zo_eps = getattr(args, "zo_eps", 1e-3)
@@ -336,6 +424,39 @@ class LLaVATrainer(Trainer):
                 param.requires_grad = False  # Ensure no accidental gradient computation
 
         self.mezo_update_history = []
+
+    def _sorted_checkpoints(self, output_dir=None, checkpoint_prefix=None, use_mtime=False):
+        if output_dir is None:
+            output_dir = self.args.output_dir
+        if checkpoint_prefix is None:
+            try:
+                from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+            except Exception:
+                PREFIX_CHECKPOINT_DIR = "checkpoint"
+            checkpoint_prefix = PREFIX_CHECKPOINT_DIR
+
+        if not os.path.isdir(output_dir):
+            return []
+
+        checkpoints = []
+        for name in os.listdir(output_dir):
+            if not name.startswith(checkpoint_prefix):
+                continue
+            path = os.path.join(output_dir, name)
+            if os.path.isdir(path):
+                checkpoints.append(path)
+
+        if use_mtime:
+            return sorted(checkpoints, key=os.path.getmtime)
+
+        def _get_step(path):
+            name = os.path.basename(path)
+            try:
+                return int(name.split("-")[-1])
+            except Exception:
+                return 0
+
+        return sorted(checkpoints, key=_get_step)
 
     ########################
     # MeZO-specific Methods
@@ -738,7 +859,7 @@ class LLaVATrainer(Trainer):
                 self.model.config.save_pretrained(output_dir)
                 torch.save(weight_to_save, os.path.join(output_dir, f"mm_projector.bin"))
         else:
-            super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)
+            super(LLaVATrainer, self)._save_checkpoint(model, trial)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, "tune_mm_mlp_adapter", False):
@@ -856,10 +977,19 @@ class LLaVATrainer(Trainer):
         if not delay_optimizer_creation:
             self.create_optimizer_and_scheduler(num_training_steps=max_steps)
 
-        self.state = TrainerState()
+        from transformers.trainer_callback import ExportableState
+
+        self.state = TrainerState(
+            stateful_callbacks=[
+                cb for cb in self.callback_handler.callbacks + [self.control]
+                if isinstance(cb, ExportableState)
+            ]
+        )
         self.state.is_hyper_param_search = trial is not None
         self.state.train_batch_size = self._train_batch_size
-
+        self.state.compute_steps(self.args, max_steps)
+        self.state.init_training_references(self, max_steps, num_train_epochs, trial)
+        
         # Compute absolute values for logging, eval, and save if given as ratio
         if args.logging_steps is not None:
             if args.logging_steps < 1:
@@ -965,6 +1095,12 @@ class LLaVATrainer(Trainer):
         ):
             self.state = TrainerState.load_from_json(os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME))
             self.compare_trainer_and_checkpoint_args(self.args, self.state)
+            # HF Trainer expects callback state to be restored before the next checkpoint save.
+            if hasattr(self, "_load_callback_state"):
+                self._load_callback_state()
+            from transformers.trainer_callback import ExportableState
+            for cb in [cb for cb in self.callback_handler.callbacks + [self.control] if isinstance(cb, ExportableState)]:
+                self.state.stateful_callbacks.setdefault(cb.__class__.__name__, cb.state())
             epochs_trained = self.state.global_step // num_update_steps_per_epoch
             if not args.ignore_data_skip:
                 steps_trained_in_current_epoch = self.state.global_step % (num_update_steps_per_epoch)
@@ -1198,7 +1334,10 @@ class LLaVATrainer(Trainer):
                     self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
                     self.control = self.callback_handler.on_step_end(args, self.state, self.control)
 
-                    self._maybe_log_save_evaluate(tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval)
+                    if "start_time" in inspect.signature(self._maybe_log_save_evaluate).parameters:
+                        self._maybe_log_save_evaluate(tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time=start_time)
+                    else:
+                        self._maybe_log_save_evaluate(tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval)
                 else:
                     self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
 
@@ -1219,7 +1358,10 @@ class LLaVATrainer(Trainer):
                 self.control.should_training_stop = True
 
             self.control = self.callback_handler.on_epoch_end(args, self.state, self.control)
-            self._maybe_log_save_evaluate(tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval)
+            if "start_time" in inspect.signature(self._maybe_log_save_evaluate).parameters:
+                self._maybe_log_save_evaluate(tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval, start_time=start_time)
+            else:
+                self._maybe_log_save_evaluate(tr_loss, grad_norm, model, trial, epoch, ignore_keys_for_eval)
 
             if DebugOption.TPU_METRICS_DEBUG in self.args.debug:
                 if is_torch_xla_available():
@@ -1355,7 +1497,7 @@ class LLaVADPOTrainer(DPOTrainer):
                 unwrapped_model = unwrap_model(model)
                 self.save_my_lora_ckpt(output_dir, self.args, unwrapped_model)
             else:
-                super(LLaVADPOTrainer, self)._save_checkpoint(model, trial, metrics)
+                super(LLaVADPOTrainer, self)._save_checkpoint(model, trial)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, "tune_mm_mlp_adapter", False):

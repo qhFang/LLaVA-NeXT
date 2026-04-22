@@ -1,16 +1,39 @@
+#!/bin/bash
+set -euxo pipefail
+
+export NCCL_DEBUG=INFO
+export NCCL_IB_GID_INDEX=3
+export NCCL_IB_TC=106
+export NCCL_CROSS_NIC=0
+export NCCL_ALGO=RING
+export NCCL_SOCKET_IFNAME=eth0
+export TORCH_DISTRIBUTED_DEBUG=DETAIL
+export NCCL_IB_TIMEOUT=22
+export NCCL_IB_RETRY_CNT=13
+export NCCL_IB_AR_THRESHOLD=0
+
+
+
 export OMP_NUM_THREADS=8
 export NCCL_IB_DISABLE=0
 export NCCL_IB_GID_INDEX=3
 export NCCL_SOCKET_IFNAME=eth0
 export NCCL_DEBUG=INFO
 
-LLM_VERSION="Qwen/Qwen2-7B-Instruct"
-LLM_VERSION_CLEAN="${LLM_VERSION//\//_}"
+source /data/250010203/aisports/env/my_bashrc
+source /data/250010203/aisports/env/.conda/etc/profile.d/conda.sh
+cd /data/250010203/aisports/Codes/LLaVA-NeXT/
+conda activate llm
+
+
+
+LLM_VERSION="/data/share/Qwen3.5-9B/"
+LLM_VERSION_CLEAN=LLM_VERSION
 VISION_MODEL_VERSION="hypertok"
 VISION_MODEL_VERSION_CLEAN="${VISION_MODEL_VERSION//\//_}"
 
-HYPERTOK_CKPT="/path/to/hypertok_checkpoint.pt"
-HYPERTOK_CONFIG="/path/to/hypertok_config.yaml"
+HYPERTOK_CKPT="/data/250010203/aisports/Codes/HyperTok/outputs/alldata_128fsq_timmvitamin_deltafilm/ckpt_epoch1.pt"
+HYPERTOK_CONFIG="/data/250010203/aisports/Codes/HyperTok/configs/default.yaml"
 HYPERTOK_FEATURE_SOURCE="quant"  # quant or decoder_sem
 HYPERTOK_QUANTIZER="fsq"
 
@@ -24,14 +47,14 @@ echo "MID_RUN_NAME: ${MID_RUN_NAME}"
 
 CKPT_PATH=$LLM_VERSION  # or your previous stage checkpoint
 
-ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NNODES}" --node_rank="${RANK}" --master_addr="${ADDR}" --master_port="${PORT}" \
+ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node=$5 --nnodes=$3 --node_rank=$4 --master_addr=$1 --master_port=$2 \
     llava/train/train_mem.py \
     --deepspeed scripts/zero3.json \
     --model_name_or_path ${CKPT_PATH} \
     --version ${PROMPT_VERSION} \
-    --data_path /data/share/250010203/data/recap558k/data/ \
+    --data_path /data/share/250010203/data/llave-next-760k/data/ \
     --image_folder /path/to/images \
-    --pretrain_mm_mlp_adapter "/checkpoints/projectors/${BASE_RUN_NAME}/mm_projector.bin" \
+    --pretrain_mm_mlp_adapter "/data/250010203/aisports/Codes/LLaVA-NeXT/checkpoints/projectors/llavanext-hypertok-LLM_VERSION-mlp2x_gelu-pretrain_blip558k_plain/mm_projector.bin" \
     --mm_tunable_parts="mm_vision_tower,mm_mlp_adapter,mm_language_model" \
     --mm_vision_tower_lr=2e-6 \
     --vision_tower ${VISION_MODEL_VERSION} \
@@ -44,17 +67,19 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --mm_use_im_start_end False \
     --mm_use_im_patch_token False \
     --group_by_modality_length True \
-    --image_aspect_ratio square \
+    --image_aspect_ratio anyres_max_9 \
+    --image_grid_pinpoints "(1x1),...,(6x6)" \
+    --mm_patch_merge_type spatial_unpad \
     --bf16 True \
     --run_name $MID_RUN_NAME \
-    --output_dir "/checkpoints/${MID_RUN_NAME}" \
+    --output_dir "/data/250010203/aisports/Codes/LLaVA-NeXT/${MID_RUN_NAME}" \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 4 \
+    --per_device_train_batch_size 2 \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps 1 \
-    --evaluation_strategy "no" \
+    --eval_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 3000 \
+    --save_steps 3500 \
     --save_total_limit 1 \
     --learning_rate 1e-5 \
     --weight_decay 0. \
@@ -66,5 +91,7 @@ ACCELERATE_CPU_AFFINITY=1 torchrun --nproc_per_node="${NUM_GPUS}" --nnodes="${NN
     --gradient_checkpointing True \
     --dataloader_num_workers 16 \
     --lazy_preprocess True \
-    --report_to wandb \
-    --attn_implementation sdpa
+    --report_to tensorboard \
+    --attn_implementation sdpa \
+    --qwen3_5_vl_weights True
+

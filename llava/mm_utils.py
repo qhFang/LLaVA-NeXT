@@ -223,7 +223,7 @@ def get_anyres_image_grid_shape(image_size, grid_pinpoints, patch_size):
         tuple: The shape of the image patch grid in the format (width, height).
     """
     if isinstance(grid_pinpoints, str) and "x" in grid_pinpoints:
-        assert patch_size in [224, 336, 384, 448, 512], "patch_size should be in [224, 336, 384, 448, 512]"
+        assert patch_size in [224, 256, 336, 384, 448, 512], "patch_size should be in [224, 256, 336, 384, 448, 512]"
         # Use regex to extract the range from the input string
         matches = re.findall(r"\((\d+)x(\d+)\)", grid_pinpoints)
         range_start = tuple(map(int, matches[0]))
@@ -254,11 +254,14 @@ def process_anyres_image(image, processor, grid_pinpoints):
     """
     # Convert grid_pinpoints from string to list
     if isinstance(grid_pinpoints, str) and "x" in grid_pinpoints:
-        try:
-            patch_size = processor.size[0]
-        except Exception as e:
-            patch_size = processor.size["shortest_edge"]
-        assert patch_size in [224, 336, 384, 448, 512], "patch_size should be in [224, 336, 384, 448, 512]"
+        if isinstance(processor.size, int):
+            patch_size = processor.size
+        else:
+            try:
+                patch_size = processor.size[0]
+            except Exception as e:
+                patch_size = processor.size["shortest_edge"]
+        assert patch_size in [224, 256, 336, 384, 448, 512], "patch_size should be in [224, 256, 336, 384, 448, 512]"
         # Use regex to extract the range from the input string
         matches = re.findall(r"\((\d+)x(\d+)\)", grid_pinpoints)
         range_start = tuple(map(int, matches[0]))
@@ -280,7 +283,9 @@ def process_anyres_image(image, processor, grid_pinpoints):
     # FIXME: this seems to be a bug that it resizes instead of pad.
     # but to keep it consistent with previous, i will keep it as it is
     # TODO: uncomment below to ablate with the padding
-    if isinstance(processor.size, dict):
+    if isinstance(processor.size, int):
+        shortest_edge = processor.size
+    elif isinstance(processor.size, dict):
         shortest_edge = processor.size["shortest_edge"]
     else:
         shortest_edge = min(processor.size)
