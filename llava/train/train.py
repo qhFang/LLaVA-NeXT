@@ -1,4 +1,4 @@
-# Adopted from https://github.com/lm-sys/FastChat. Below is the original copyright:
+﻿# Adopted from https://github.com/lm-sys/FastChat. Below is the original copyright:
 # Adopted from tatsu-lab@stanford_alpaca. Below is the original copyright:
 #    Copyright 2023 Rohan Taori, Ishaan Gulrajani, Tianyi Zhang, Yann Dubois, Xuechen Li
 #
@@ -52,12 +52,19 @@ from transformers.utils import (
 )
 from transformers.utils.hub import cached_file, get_checkpoint_shard_files
 from torch.utils.data import Dataset
-from torchvision import transforms
-from llava.constants import IGNORE_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IMAGE_TOKEN_INDEX
+from llava.constants import (
+    IGNORE_INDEX,
+    DEFAULT_IMAGE_TOKEN,
+    DEFAULT_IMAGE_GENERATION_TOKEN,
+    DEFAULT_IM_START_TOKEN,
+    DEFAULT_IM_END_TOKEN,
+    IMAGE_TOKEN_INDEX,
+)
 from llava.train.llava_trainer import LLaVATrainer
 
 from llava import conversation as conversation_lib
 from llava.model import *
+from llava.model.multimodal_encoder.hypertok_image_processor import HypertokImageProcessor
 from llava.mm_utils import process_highres_image, process_anyres_image, process_highres_image_crop_split, tokenizer_image_token
 from llava.utils import rank0_print, process_video_with_pyav, process_video_with_decord
 
@@ -142,6 +149,14 @@ class ModelArguments:
     hypertok_decoder_film_layer_num: Optional[int] = field(default=5)
     hypertok_decoder_hidden_dim: Optional[int] = field(default=768)
     hypertok_decoder_num_heads: Optional[int] = field(default=16)
+    enable_image_generation: bool = field(default=False)
+    image_generation_token: str = field(default=DEFAULT_IMAGE_GENERATION_TOKEN)
+    image_generation_num_latents: Optional[int] = field(default=256)
+    image_generation_projector_type: str = field(default="mlp2x_gelu")
+    image_generation_loss_weight: float = field(default=1.0)
+    image_generation_latent_loss_weight: float = field(default=1.0)
+    image_generation_recon_loss_weight: float = field(default=1.0)
+    image_generation_tune_decoder: bool = field(default=False)
     qwen3_5_vl_weights: Optional[bool] = field(
         default=None,
         metadata={
@@ -173,29 +188,13 @@ class DataArguments:
     parquet_conversation_column: Optional[str] = field(default="conversations")
     parquet_id_column: Optional[str] = field(default="id")
     use_hypertok_tfm: bool = field(default=False)
-
-
-class HypertokImageProcessor:
-    def __init__(self, size: int):
-        self.size = size
-        self.crop_size = {"height": size, "width": size}
-        self.image_mean = [0.5, 0.5, 0.5]
-        self.image_std = [0.5, 0.5, 0.5]
-        self._tfm = transforms.Compose(
-            [
-                transforms.Resize(size, interpolation=transforms.InterpolationMode.BICUBIC),
-                transforms.CenterCrop(size),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=self.image_mean, std=self.image_std),
-            ]
-        )
-
-    def preprocess(self, image, return_tensors="pt"):
-        if isinstance(image, list):
-            tensor_list = [self._tfm(img) for img in image]
-            return {"pixel_values": torch.stack(tensor_list, dim=0)}
-        tensor = self._tfm(image)
-        return {"pixel_values": tensor.unsqueeze(0)}
+    enable_image_generation: bool = field(default=False)
+    image_generation_token: str = field(default=DEFAULT_IMAGE_GENERATION_TOKEN)
+    image_generation_num_latents: int = field(default=256)
+    image_generation_prompt_column: Optional[str] = field(default="text")
+    image_generation_image_column: Optional[str] = field(default=None)
+    image_generation_prompt_suffix: str = field(default=" Generate an image based on this description.")
+    image_generation_uncond_ratio: float = field(default=0.0)
 
 
 @dataclass
@@ -339,7 +338,14 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
     if hasattr(trainer.args, "tune_mm_mlp_adapter") and trainer.args.tune_mm_mlp_adapter:
         check_only_save_mm_adapter_tunnable = True
     # only has mm_mlp_adapter and mm_vision_resampler in the tuneable parts
-    elif hasattr(trainer.args, "mm_tunable_parts") and (len(trainer.args.mm_tunable_parts.split(",")) == 1 and ("mm_mlp_adapter" in trainer.args.mm_tunable_parts or "mm_vision_resampler" in trainer.args.mm_tunable_parts)):
+    elif hasattr(trainer.args, "mm_tunable_parts") and (
+        len(trainer.args.mm_tunable_parts.split(",")) == 1
+        and (
+            "mm_mlp_adapter" in trainer.args.mm_tunable_parts
+            or "mm_vision_resampler" in trainer.args.mm_tunable_parts
+            or "image_generation_projector" in trainer.args.mm_tunable_parts
+        )
+    ):
         check_only_save_mm_adapter_tunnable = True
     else:
         check_only_save_mm_adapter_tunnable = False
@@ -349,7 +355,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
     rank0_print(f"Only save projectors: {check_only_save_mm_adapter_tunnable}")
     if check_only_save_mm_adapter_tunnable:
         # Only save Adapter
-        keys_to_match = ["mm_projector", "vision_resampler"]
+        keys_to_match = ["mm_projector", "vision_resampler", "image_generation_projector"]
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(["embed_tokens", "embed_in"])
 
@@ -788,7 +794,7 @@ def preprocess_llama3(
     unmask_tokens_idx = [tokenizer.convert_tokens_to_ids(tok) for tok in unmask_tokens]
 
     # After update, calling tokenizer of llama3 will
-    # auto add bos id for the tokens. ヽ(｀⌒´)ﾉ
+    # auto add bos id for the tokens. 銉?锝€鈱捖?锞?
     def safe_tokenizer_llama3(text):
         input_ids = tokenizer(text).input_ids
         if input_ids[0] == bos_token_id:
@@ -1489,6 +1495,96 @@ class LazySupervisedDataset(Dataset):
             image = processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
         return image, image_size, "image"
 
+    def _open_image(self, image_file):
+        image_folder = self.data_args.image_folder
+        if isinstance(image_file, (bytes, bytearray, memoryview)):
+            return Image.open(io.BytesIO(image_file)).convert("RGB")
+        image_path = os.path.join(image_folder, image_file) if image_folder is not None else image_file
+        return Image.open(image_path).convert("RGB")
+
+    def _is_image_generation_sample(self, sample: Dict) -> bool:
+        if not self.data_args.enable_image_generation:
+            return False
+        if sample.get("generation") is True or sample.get("task") in {"t2i", "text_to_image", "image_generation"}:
+            return True
+        if sample.get("data_type") in {"image_text", "text_image", "t2i"}:
+            return True
+        prompt_column = self.data_args.image_generation_prompt_column
+        image_column = self.data_args.image_generation_image_column
+        has_prompt = prompt_column is not None and prompt_column in sample
+        has_image = (image_column in sample) if image_column else ("image" in sample or "image_path" in sample)
+        return has_prompt and has_image and "conversations" not in sample
+
+    def _get_image_generation_image_value(self, sample: Dict):
+        image_column = self.data_args.image_generation_image_column
+        if image_column and image_column in sample:
+            return sample[image_column]
+        if "image" in sample:
+            return sample["image"]
+        if "image_path" in sample:
+            return sample["image_path"]
+        raise ValueError(f"Image generation sample is missing an image field: {sample.keys()}")
+
+    def _get_image_generation_prompt(self, sample: Dict) -> str:
+        prompt_column = self.data_args.image_generation_prompt_column
+        if prompt_column and prompt_column in sample:
+            prompt = sample[prompt_column]
+        elif "prompt" in sample:
+            prompt = sample["prompt"]
+        elif "caption" in sample:
+            prompt = sample["caption"]
+        else:
+            raise ValueError(f"Image generation sample is missing a prompt field: {sample.keys()}")
+        if isinstance(prompt, (list, tuple)):
+            prompt = " ".join(str(x) for x in prompt)
+        prompt = str(prompt).strip()
+        if self.data_args.image_generation_uncond_ratio > 0 and random.random() < self.data_args.image_generation_uncond_ratio:
+            prompt = "<unconditional>"
+        else:
+            prompt = prompt + self.data_args.image_generation_prompt_suffix
+        return prompt
+
+    def _build_image_generation_item(self, sample: Dict, idx) -> Dict[str, torch.Tensor]:
+        image_value = self._get_image_generation_image_value(sample)
+        if isinstance(image_value, list):
+            image_value = image_value[0]
+        image = self._open_image(image_value)
+        target = self.data_args.image_processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
+
+        latent_token = self.data_args.image_generation_token
+        num_latents = int(self.data_args.image_generation_num_latents)
+        text = self._get_image_generation_prompt(sample)
+        eos = self.tokenizer.eos_token or ""
+        sequence = text + "".join([latent_token] * num_latents) + eos
+        input_ids = self.tokenizer(
+            sequence,
+            return_tensors="pt",
+            padding="longest",
+            max_length=self.tokenizer.model_max_length,
+            truncation=True,
+        ).input_ids[0]
+        token_id = self.tokenizer.convert_tokens_to_ids(latent_token)
+        image_generation_mask = input_ids.eq(token_id)
+        if int(image_generation_mask.sum().item()) != num_latents:
+            raise ValueError(
+                f"Expected {num_latents} image latent tokens, found {int(image_generation_mask.sum().item())}. "
+                f"Make sure {latent_token} was added to the tokenizer and model_max_length is large enough."
+            )
+        labels = torch.full_like(input_ids, IGNORE_INDEX)
+        data_dict = {
+            "input_ids": input_ids,
+            "labels": labels,
+            "image_generation_mask": image_generation_mask,
+            "image_generation_target": target,
+            "id": sample.get("id", idx),
+        }
+        if self.data_args.is_multimodal:
+            crop_size = self.data_args.image_processor.crop_size
+            data_dict["image"] = [
+                (torch.zeros(1, 3, crop_size["height"], crop_size["width"]), (crop_size["width"], crop_size["height"]), "text"),
+            ]
+        return data_dict
+
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         # TODO: define number of retries somewhere else
         num_base_retries = 3
@@ -1532,6 +1628,9 @@ class LazySupervisedDataset(Dataset):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
         sample = sources[0]
+
+        if self._is_image_generation_sample(sample):
+            return self._build_image_generation_item(sample, i)
 
         image = None
         has_image = False
@@ -1677,9 +1776,15 @@ class DataCollatorForSupervisedDataset(object):
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
+        image_generation_masks = [instance.get("image_generation_mask") for instance in instances]
         # input_ids, labels, ids = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels", "id"))
         input_ids = [_input_ids[: self.tokenizer.model_max_length] for _input_ids in input_ids]
         labels = [_labels[: self.tokenizer.model_max_length] for _labels in labels]
+        if any(mask is not None for mask in image_generation_masks):
+            image_generation_masks = [
+                (mask if mask is not None else torch.zeros_like(instance["input_ids"], dtype=torch.bool))[: self.tokenizer.model_max_length]
+                for mask, instance in zip(image_generation_masks, instances)
+            ]
         if self.tokenizer.pad_token_id is None:
             # self.tokenizer.pad_token_id = self.tokenizer.eos_token_id  # FIXME: this could only be triggered for llama3 model.
             self.tokenizer.pad_token_id = 0 # This gets the best result. Don't know why.
@@ -1688,8 +1793,19 @@ class DataCollatorForSupervisedDataset(object):
         batch = dict(input_ids=input_ids, labels=labels.long() if labels.dtype == torch.int32 else labels, attention_mask=input_ids.ne(self.tokenizer.pad_token_id))
         # batch = dict(input_ids=input_ids, labels=labels, attention_mask=input_ids.ne(self.tokenizer.pad_token_id), ids=ids)
 
-        if "image" in instances[0]:
-            images = [instance["image"] for instance in instances]
+        if any(mask is not None for mask in image_generation_masks):
+            batch["image_generation_mask"] = self.pad_sequence(
+                image_generation_masks,
+                batch_first=True,
+                padding_value=False,
+            ).bool()
+            target_images = [instance.get("image_generation_target") for instance in instances]
+            valid_targets = [target for target in target_images if target is not None]
+            if valid_targets:
+                batch["image_generation_targets"] = torch.stack(valid_targets, dim=0)
+
+        if any("image" in instance for instance in instances):
+            images = [instance["image"] for instance in instances if "image" in instance]
 
             batch["image_sizes"] = [im[1] for im_list in images for im in im_list]
             batch["modalities"] = [im[2] for im_list in images for im in im_list]
@@ -2162,6 +2278,14 @@ def train(attn_implementation=None):
         else:
             conversation_lib.default_conversation = conversation_lib.conv_templates["qwen_3_5"]
 
+    if model_args.enable_image_generation:
+        added = tokenizer.add_tokens([model_args.image_generation_token], special_tokens=True)
+        if added > 0:
+            model.resize_token_embeddings(len(tokenizer))
+        data_args.enable_image_generation = True
+        data_args.image_generation_token = model_args.image_generation_token
+        if model_args.image_generation_num_latents is not None:
+            data_args.image_generation_num_latents = int(model_args.image_generation_num_latents)
 
     if model_args.vision_tower is not None:
         model.get_model().initialize_vision_modules(model_args=model_args, fsdp=training_args.fsdp)
@@ -2208,6 +2332,17 @@ def train(attn_implementation=None):
         model.config.add_time_instruction = data_args.add_time_instruction
         model.config.force_sample = data_args.force_sample
         model.config.mm_spatial_pool_stride = model_args.mm_spatial_pool_stride
+        model.config.enable_image_generation = model_args.enable_image_generation
+        model.config.image_generation_token = model_args.image_generation_token
+        model.config.image_generation_num_latents = int(
+            getattr(model.config, "image_generation_num_latents", None)
+            or model_args.image_generation_num_latents
+            or vision_tower.num_patches
+        )
+        model.config.image_generation_loss_weight = model_args.image_generation_loss_weight
+        model.config.image_generation_latent_loss_weight = model_args.image_generation_latent_loss_weight
+        model.config.image_generation_recon_loss_weight = model_args.image_generation_recon_loss_weight
+        data_args.image_generation_num_latents = model.config.image_generation_num_latents
 
         ### Deciding train which part of the model
         if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
@@ -2250,6 +2385,9 @@ def train(attn_implementation=None):
             tunable_parts = model_args.mm_tunable_parts.split(",")
             if "mm_mlp_adapter" in tunable_parts:
                 for p in model.get_model().mm_projector.parameters():
+                    p.requires_grad = True
+            if "image_generation_projector" in tunable_parts and hasattr(model.get_model(), "image_generation_projector"):
+                for p in model.get_model().image_generation_projector.parameters():
                     p.requires_grad = True
             if "mm_vision_resampler" in tunable_parts:
                 for p in model.get_model().vision_resampler.parameters():
@@ -2326,3 +2464,5 @@ def train(attn_implementation=None):
 
 if __name__ == "__main__":
     train()
+
+

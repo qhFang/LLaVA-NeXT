@@ -20,6 +20,8 @@ import re
 import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from .multimodal_encoder.builder import build_vision_tower
 from .multimodal_resampler.builder import build_vision_resampler
 from .multimodal_projector.builder import build_vision_projector
@@ -41,6 +43,8 @@ class LlavaMetaModel:
             self.vision_tower = build_vision_tower(config, delay_load=delay_load)
             self.vision_resampler = build_vision_resampler(config, vision_tower=self.vision_tower)
             self.mm_projector = build_vision_projector(config, vision_cfg=self.vision_tower.config)
+            if getattr(config, "enable_image_generation", False):
+                self.initialize_image_generation_modules(config, self.vision_tower)
 
             if "unpad" in getattr(config, "mm_patch_merge_type", ""):
                 self.image_newline = nn.Parameter(torch.empty(config.hidden_size, dtype=self.dtype))
@@ -76,6 +80,13 @@ class LlavaMetaModel:
             "hypertok_decoder_film_layer_num",
             "hypertok_decoder_hidden_dim",
             "hypertok_decoder_num_heads",
+            "enable_image_generation",
+            "image_generation_projector_type",
+            "image_generation_num_latents",
+            "image_generation_loss_weight",
+            "image_generation_latent_loss_weight",
+            "image_generation_recon_loss_weight",
+            "image_generation_tune_decoder",
         ]:
             if hasattr(model_args, attr):
                 setattr(self.config, attr, getattr(model_args, attr))
@@ -141,6 +152,46 @@ class LlavaMetaModel:
             rank0_print(f"Loaded mm projector weights from {pretrain_mm_mlp_adapter}. Incompatible keys: {incompatible_keys}")
             incompatible_keys = self.vision_resampler.load_state_dict(get_w(mm_projector_weights, "vision_resampler"), strict=False)
             rank0_print(f"Loaded vision resampler weights from {pretrain_mm_mlp_adapter}. Incompatible keys: {incompatible_keys}")
+
+        if getattr(self.config, "enable_image_generation", False):
+            self.initialize_image_generation_modules(model_args, vision_tower)
+
+    def _build_image_generation_projector(self, projector_type: str, out_dim: int):
+        if projector_type == "linear":
+            return nn.Linear(self.config.hidden_size, out_dim)
+
+        mlp_gelu_match = re.match(r"^mlp(\d+)x_gelu$", projector_type)
+        if mlp_gelu_match:
+            mlp_depth = int(mlp_gelu_match.group(1))
+            modules = []
+            for _ in range(max(mlp_depth - 1, 0)):
+                modules.append(nn.Linear(self.config.hidden_size, self.config.hidden_size))
+                modules.append(nn.GELU())
+            modules.append(nn.Linear(self.config.hidden_size, out_dim))
+            return nn.Sequential(*modules)
+
+        raise ValueError(f"Unknown image generation projector type: {projector_type}")
+
+    def initialize_image_generation_modules(self, model_args, vision_tower=None):
+        if vision_tower is None:
+            vision_tower = self.get_vision_tower()
+        if vision_tower is None:
+            raise ValueError("Image generation requires a HyperTok vision tower.")
+        if not getattr(vision_tower, "is_loaded", True) and not hasattr(vision_tower, "latent_size"):
+            vision_tower.load_model()
+        if not hasattr(vision_tower, "decode_latents"):
+            raise ValueError("Image generation currently requires a HyperTok vision tower with a decoder.")
+
+        latent_dim = int(getattr(vision_tower, "latent_size", getattr(vision_tower, "hidden_size")))
+        self.config.image_generation_latent_dim = latent_dim
+        if getattr(model_args, "image_generation_num_latents", None) is None:
+            self.config.image_generation_num_latents = int(getattr(vision_tower, "num_patches", 0))
+        projector_type = getattr(model_args, "image_generation_projector_type", "mlp2x_gelu")
+        self.config.image_generation_projector_type = projector_type
+
+        projector = getattr(self, "image_generation_projector", None)
+        if projector is None:
+            self.image_generation_projector = self._build_image_generation_projector(projector_type, latent_dim)
 
 
 def unpad_image(tensor, original_size):
@@ -266,6 +317,165 @@ class LlavaMetaForCausalLM(ABC):
         image_feature =  torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
         image_feature = image_feature.permute(1, 2, 0).contiguous()
         return image_feature
+
+    def _compute_lm_loss(self, logits, labels):
+        if labels is None:
+            return None
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous().to(shift_logits.device)
+        valid = shift_labels.ne(IGNORE_INDEX)
+        if not valid.any():
+            return shift_logits.sum() * 0.0
+        loss_fct = nn.CrossEntropyLoss()
+        return loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+    def _compute_image_generation_loss(self, hidden_states, image_generation_mask, image_generation_targets):
+        if image_generation_mask is None or image_generation_targets is None:
+            return None
+        if not hasattr(self.get_model(), "image_generation_projector"):
+            raise RuntimeError("Image generation projector is not initialized.")
+
+        image_generation_mask = image_generation_mask.to(device=hidden_states.device, dtype=torch.bool)
+        if image_generation_mask.shape[1] != hidden_states.shape[1]:
+            target_len = hidden_states.shape[1]
+            cur_len = image_generation_mask.shape[1]
+            if cur_len > target_len:
+                if getattr(self.config, "tokenizer_padding_side", "right") == "left":
+                    image_generation_mask = image_generation_mask[:, -target_len:]
+                else:
+                    image_generation_mask = image_generation_mask[:, :target_len]
+            else:
+                pad = torch.zeros(
+                    image_generation_mask.shape[0],
+                    target_len - cur_len,
+                    dtype=torch.bool,
+                    device=image_generation_mask.device,
+                )
+                if getattr(self.config, "tokenizer_padding_side", "right") == "left":
+                    image_generation_mask = torch.cat([pad, image_generation_mask], dim=1)
+                else:
+                    image_generation_mask = torch.cat([image_generation_mask, pad], dim=1)
+
+        shift_hidden_states = hidden_states[:, :-1, :]
+        shift_mask = image_generation_mask[:, 1:]
+        num_latents = int(getattr(self.config, "image_generation_num_latents", 0))
+        if num_latents <= 0:
+            raise ValueError("image_generation_num_latents must be positive.")
+
+        pred_latents = self.get_model().image_generation_projector(shift_hidden_states)
+        pred_latent_list = []
+        for batch_idx in range(pred_latents.shape[0]):
+            cur = pred_latents[batch_idx][shift_mask[batch_idx]]
+            if cur.numel() == 0:
+                continue
+            if cur.shape[0] < num_latents:
+                raise ValueError(
+                    f"Image generation mask has {cur.shape[0]} latent positions, expected {num_latents}."
+                )
+            pred_latent_list.append(cur[:num_latents])
+
+        if not pred_latent_list:
+            return hidden_states.sum() * 0.0
+
+        pred_latents = torch.stack(pred_latent_list, dim=0)
+        target_images = image_generation_targets[: pred_latents.shape[0]].to(
+            device=pred_latents.device,
+            dtype=pred_latents.dtype,
+        )
+        vision_tower = self.get_vision_tower()
+        with torch.no_grad():
+            target_latents = vision_tower.encode_latents(target_images, quantize=True).to(dtype=pred_latents.dtype)
+
+        if target_latents.shape[1] != pred_latents.shape[1]:
+            raise ValueError(
+                f"Predicted latent length {pred_latents.shape[1]} does not match HyperTok target length {target_latents.shape[1]}."
+            )
+
+        latent_loss = F.mse_loss(pred_latents.float(), target_latents.float())
+        recon_loss = pred_latents.sum() * 0.0
+        recon_weight = float(getattr(self.config, "image_generation_recon_loss_weight", 1.0))
+        if recon_weight > 0:
+            pred_images = vision_tower.decode_latents(pred_latents)
+            if pred_images.shape != target_images.shape:
+                target_images_for_loss = F.interpolate(
+                    target_images.float(),
+                    size=pred_images.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                ).to(dtype=pred_images.dtype)
+            else:
+                target_images_for_loss = target_images
+            recon_loss = F.l1_loss(pred_images.float(), target_images_for_loss.float())
+
+        latent_weight = float(getattr(self.config, "image_generation_latent_loss_weight", 1.0))
+        loss_weight = float(getattr(self.config, "image_generation_loss_weight", 1.0))
+        return loss_weight * (latent_weight * latent_loss + recon_weight * recon_loss)
+
+    def forward_with_image_generation(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        labels=None,
+        use_cache=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        images=None,
+        image_sizes=None,
+        return_dict=None,
+        modalities=["image"],
+        image_generation_mask=None,
+        image_generation_targets=None,
+    ):
+        if inputs_embeds is None:
+            (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = self.prepare_inputs_labels_for_multimodal(
+                input_ids,
+                position_ids,
+                attention_mask,
+                past_key_values,
+                labels,
+                images,
+                modalities,
+                image_sizes,
+            )
+
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        hidden_states = outputs[0]
+        logits = self.lm_head(hidden_states)
+
+        loss = self._compute_lm_loss(logits, labels)
+        image_generation_loss = self._compute_image_generation_loss(
+            hidden_states,
+            image_generation_mask,
+            image_generation_targets,
+        )
+        if image_generation_loss is not None:
+            loss = image_generation_loss if loss is None else loss + image_generation_loss
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
     def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities=["image"], image_sizes=None):
         vision_tower = self.get_vision_tower()

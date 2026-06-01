@@ -16,15 +16,86 @@
 import os
 import warnings
 import shutil
+import psutil
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, BitsAndBytesConfig
+from transformers.modeling_utils import load_state_dict
+from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGHTS_INDEX_NAME, WEIGHTS_NAME
+from transformers.utils.hub import get_checkpoint_shard_files
 import torch
 from llava.model import *
 from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+
 from llava.utils import rank0_print
 
 
+def _mem(tag):
+    proc = psutil.Process(os.getpid())
+    rss_gb = proc.memory_info().rss / 1024 / 1024 / 1024
+    msg = f"[MEM] {tag} | rss={rss_gb:.2f} GB"
+    if torch.cuda.is_available():
+        alloc = torch.cuda.memory_allocated() / 1024 / 1024 / 1024
+        reserved = torch.cuda.memory_reserved() / 1024 / 1024 / 1024
+        msg += f" | cuda_alloc={alloc:.2f} GB | cuda_reserved={reserved:.2f} GB"
+    print(msg, flush=True)
+
+
+def _resolve_local_checkpoint_files(model_path):
+    index_candidates = [SAFE_WEIGHTS_INDEX_NAME, WEIGHTS_INDEX_NAME]
+    for index_name in index_candidates:
+        index_file = os.path.join(model_path, index_name)
+        if os.path.exists(index_file):
+            shard_files, _ = get_checkpoint_shard_files(model_path, index_file)
+            return shard_files
+
+    weight_candidates = [SAFE_WEIGHTS_NAME, WEIGHTS_NAME]
+    for weight_name in weight_candidates:
+        weight_file = os.path.join(model_path, weight_name)
+        if os.path.exists(weight_file):
+            return [weight_file]
+
+    raise FileNotFoundError(f"Could not find weights in {model_path}")
+
+
+def _load_local_state_dict(model_path):
+    state_dict = {}
+    for shard_file in _resolve_local_checkpoint_files(model_path):
+        shard_state = load_state_dict(shard_file)
+        state_dict.update(shard_state)
+    return state_dict
+
+
+def _load_prefixed_state_dict(model_path, prefix):
+    prefix_dot = prefix if prefix.endswith(".") else prefix + "."
+    filtered_state = {}
+    for shard_file in _resolve_local_checkpoint_files(model_path):
+        shard_state = load_state_dict(shard_file)
+        for key, value in shard_state.items():
+            if key.startswith(prefix_dot):
+                filtered_state[key[len(prefix_dot):]] = value
+    return filtered_state
+
+
+def _load_finetuned_vision_tower_weights(model_path, vision_tower):
+    vision_state = _load_prefixed_state_dict(model_path, "model.vision_tower")
+    if not vision_state:
+        rank0_print(f"No finetuned vision_tower weights found in {model_path}")
+        return
+
+    incompatible = vision_tower.load_state_dict(vision_state, strict=False)
+    missing = len(getattr(incompatible, "missing_keys", []) or [])
+    unexpected = len(getattr(incompatible, "unexpected_keys", []) or [])
+    rank0_print(
+        f"Loaded finetuned vision_tower weights from {model_path}. missing={missing} unexpected={unexpected}"
+    )
+    if missing:
+        rank0_print(f"vision_tower missing keys (first 20): {incompatible.missing_keys[:20]}")
+    if unexpected:
+        rank0_print(f"vision_tower unexpected keys (first 20): {incompatible.unexpected_keys[:20]}")
+
+
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", torch_dtype="float16",attn_implementation="flash_attention_2", customized_config=None, overwrite_config=None, **kwargs):
+    _mem("enter load_pretrained_model")
     kwargs["device_map"] = device_map
 
     if load_8bit:
@@ -203,6 +274,36 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
 
                 model = LlavaLlamaForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, attn_implementation=attn_implementation, config=llava_cfg, **kwargs)
 
+            elif "qwen3" in model_name.lower() or "qwen3_5" in model_name.lower() or "qwen3.5" in model_name.lower():
+                _mem("before qwen3_5 tokenizer")
+                tokenizer = AutoTokenizer.from_pretrained(model_path)
+                _mem("after qwen3_5 tokenizer")
+                from llava.model.language_model.llava_qwen3_5 import LlavaQwen3_5Config
+
+                _mem("before qwen3_5 config load")
+                llava_cfg = LlavaQwen3_5Config.from_pretrained(model_path)
+                _mem("after qwen3_5 config load")
+                if overwrite_config is not None:
+                    rank0_print(f"Overwriting config with {overwrite_config}")
+                    for k, v in overwrite_config.items():
+                        setattr(llava_cfg, k, v)
+
+                # Avoid constructing HyperTok on the HF meta init path; builder will load it later.
+                llava_cfg.delay_load = True
+                llava_cfg.unfreeze_mm_vision_tower = False
+                if hasattr(llava_cfg, "mm_tunable_parts"):
+                    llava_cfg.mm_tunable_parts = ""
+
+                _mem("before qwen3_5 from_pretrained")
+                model = LlavaQwen3_5ForCausalLM.from_pretrained(
+                    model_path,
+                    low_cpu_mem_usage=True,
+                    attn_implementation=attn_implementation,
+                    config=llava_cfg,
+                    **kwargs,
+                )
+                _mem("after qwen3_5 from_pretrained")
+
             elif "qwen" in model_name.lower() or "quyen" in model_name.lower():
                 tokenizer = AutoTokenizer.from_pretrained(model_path)
                 if "moe" in model_name.lower() or "A14B" in model_name.lower():
@@ -284,11 +385,22 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)
         if mm_use_im_start_end:
             tokenizer.add_tokens([DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)
+        _mem("before resize_token_embeddings")
         model.resize_token_embeddings(len(tokenizer))
+        _mem("after resize_token_embeddings")
 
+        _mem("before get_vision_tower")
         vision_tower = model.get_vision_tower()
+        _mem("after get_vision_tower")
         if not vision_tower.is_loaded:
+            _mem("before vision_tower.load_model")
             vision_tower.load_model(device_map=device_map)
+            _mem("after vision_tower.load_model")
+
+        _mem("before finetuned vision_tower load")
+        _load_finetuned_vision_tower_weights(model_path, vision_tower)
+        _mem("after finetuned vision_tower load")
+
         if device_map != "auto":
             vision_tower.to(device="cuda", dtype=torch.float16)
         image_processor = vision_tower.image_processor
@@ -303,3 +415,8 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         context_len = 2048
 
     return tokenizer, model, image_processor, context_len
+
+
+
+
+

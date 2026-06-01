@@ -4,12 +4,12 @@ from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
-from transformers import CLIPImageProcessor
 import yaml
 import timm
 from timm.data import resolve_model_data_config
 
 from llava.utils import rank0_print
+from llava.model.multimodal_encoder.hypertok_image_processor import HypertokImageProcessor
 from llava.model.hypertok import (
     GeGluMlp,
     VitaminDecoder,
@@ -50,6 +50,7 @@ class HyperTokVisionTower(nn.Module):
         self.decoder_film_layer_num = int(getattr(args, "hypertok_decoder_film_layer_num", None) or self._cfg_get("decoder", "film_layer_num", default=5))
         self.decoder_hidden_dim = int(getattr(args, "hypertok_decoder_hidden_dim", 768))
         self.decoder_num_heads = int(getattr(args, "hypertok_decoder_num_heads", 16))
+        self.enable_image_generation = bool(getattr(args, "enable_image_generation", False))
 
         self._use_decoder = self.feature_source == "decoder_sem"
 
@@ -179,7 +180,7 @@ class HyperTokVisionTower(nn.Module):
         raise ValueError(f"Unknown HyperTok quantizer: {self.quantizer_type}")
 
     def _build_decoder(self, embed_dim: int):
-        if not self._use_decoder:
+        if not (self._use_decoder or self.enable_image_generation):
             return None
         if self.decoder_variant == "ours":
             return VitaminDecoderHyperFilm(
@@ -207,11 +208,15 @@ class HyperTokVisionTower(nn.Module):
         raise ValueError(f"Unknown HyperTok decoder variant: {self.decoder_variant}")
 
     def load_model(self, device_map=None):
+        print("[HT] enter load_model", flush=True)
+        print(f"[HT] encoder_name={self.encoder_name} image_size={self.image_size}", flush=True)
         if self.is_loaded:
             rank0_print(f"{self.vision_tower_name} is already loaded, `load_model` called again, skipping.")
             return
 
+        print("[HT] before _build_encoder", flush=True)
         self.encoder = self._build_encoder()
+        print("[HT] after _build_encoder", flush=True)
         self.encoder.requires_grad_(False)
 
         embed_dim = getattr(self.encoder, "embed_dim", None) or getattr(self.encoder, "num_features", None)
@@ -219,23 +224,20 @@ class HyperTokVisionTower(nn.Module):
             raise ValueError("Unable to infer HyperTok encoder embedding dimension.")
         self._embed_dim = int(embed_dim)
 
+        print("[HT] before _build_quantizer", flush=True)
         self.quantizer = self._build_quantizer(self._embed_dim)
+        print("[HT] after _build_quantizer", flush=True)
         if self.quantizer is not None:
             self.quantizer.requires_grad_(False)
 
+        print("[HT] before _build_decoder", flush=True)
         self.decoder = self._build_decoder(self._embed_dim)
+        print("[HT] after _build_decoder", flush=True)
         if self.decoder is not None:
-            self.decoder.requires_grad_(False)
+            self.decoder.requires_grad_(bool(getattr(self.args, "image_generation_tune_decoder", False)))
 
-        data_cfg = resolve_model_data_config(self.encoder)
-        mean = data_cfg.get("mean", (0.5, 0.5, 0.5))
-        std = data_cfg.get("std", (0.5, 0.5, 0.5))
-        self.image_processor = CLIPImageProcessor(
-            size={"shortest_edge": self.image_size},
-            crop_size={"height": self.image_size, "width": self.image_size},
-            image_mean=list(mean),
-            image_std=list(std),
-        )
+        resolve_model_data_config(self.encoder)
+        self.image_processor = HypertokImageProcessor(size=self.image_size)
         rank0_print(f"Loaded HyperTok image processor: {self.image_processor}")
 
         self._config = SimpleNamespace(
@@ -245,7 +247,9 @@ class HyperTokVisionTower(nn.Module):
         )
 
         ckpt_path = getattr(self.args, "vision_tower_pretrained", None)
+        print("[HT] before _load_weights", flush=True)
         self._load_weights(ckpt_path)
+        print("[HT] after _load_weights", flush=True)
 
         self.is_loaded = True
 
@@ -268,6 +272,21 @@ class HyperTokVisionTower(nn.Module):
             return out[0]
         return out
 
+    def encode_latents(self, images, quantize: bool = True):
+        images = images.to(device=self.device, dtype=self.dtype)
+        z = self.encoder(images)
+        if z.dim() == 2:
+            z = z.unsqueeze(1)
+        if quantize:
+            z = self._quantize(z)
+        return z
+
+    def decode_latents(self, latents):
+        if self.decoder is None:
+            raise RuntimeError("HyperTok decoder is not loaded. Enable image generation or use decoder_sem.")
+        latents = latents.to(device=self.device, dtype=self.dtype)
+        return self.decoder(latents, task="vis")
+
     def forward(self, images):
         if type(images) is list:
             image_features = []
@@ -278,11 +297,7 @@ class HyperTokVisionTower(nn.Module):
         return self._forward_once(images)
 
     def _forward_once(self, images):
-        images = images.to(device=self.device, dtype=self.dtype)
-        z = self.encoder(images)
-        if z.dim() == 2:
-            z = z.unsqueeze(1)
-        z_q = self._quantize(z)
+        z_q = self.encode_latents(images, quantize=True)
 
         if self._use_decoder:
             sem_out, _, _ = self.decoder(z_q, task="sem")
@@ -315,6 +330,10 @@ class HyperTokVisionTower(nn.Module):
         return self._embed_dim
 
     @property
+    def latent_size(self):
+        return self._embed_dim
+
+    @property
     def num_patches_per_side(self):
         if self._use_decoder:
             return 1
@@ -339,3 +358,5 @@ class HyperTokVisionTower(nn.Module):
     @image_size.setter
     def image_size(self, value):
         self._image_size = int(value)
+
+

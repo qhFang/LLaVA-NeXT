@@ -77,7 +77,28 @@ class LlavaQwenMoeForCausalLM(Qwen2MoeForCausalLM, LlavaMetaForCausalLM):
         modalities: Optional[List[str]] = ["image"],
         dpo_forward: Optional[bool] = False,
         cache_position=None,
+        image_generation_mask: Optional[torch.Tensor] = None,
+        image_generation_targets: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+
+        if image_generation_mask is not None or image_generation_targets is not None:
+            return self.forward_with_image_generation(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                labels=labels,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                images=images,
+                image_sizes=image_sizes,
+                return_dict=return_dict,
+                modalities=modalities,
+                image_generation_mask=image_generation_mask,
+                image_generation_targets=image_generation_targets,
+            )
 
         if inputs_embeds is None:
             (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes)
